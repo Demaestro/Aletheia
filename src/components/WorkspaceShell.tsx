@@ -130,6 +130,8 @@ export function WorkspaceShell({
               >
                 <option value="en" className="bg-mist text-white">English</option>
                 <option value="ig" className="bg-mist text-white">Igbo</option>
+                <option value="yo" className="bg-mist text-white">Yorùbá</option>
+                <option value="ha" className="bg-mist text-white">Hausa</option>
               </select>
             </div>
             <TopBadge label={isDesktop ? "Desktop" : "Browser"} tone={isDesktop ? "ok" : "warn"} />

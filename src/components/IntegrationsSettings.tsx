@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Cable, FileText, Network, PlugZap, RadioTower, SlidersHorizontal, Trash2 } from "lucide-react";
 import { integrations as defaultIntegrations } from "../data/production";
-import { generateEasyWorshipSmbSetupGuide } from "../services/desktopApi";
+import {
+  generateEasyWorshipSmbSetupGuide,
+  exportOperatorConfig,
+  importOperatorConfig
+} from "../services/desktopApi";
 
 import type {
   AdapterDispatchResult,
@@ -195,6 +199,79 @@ export function IntegrationsSettings({
   const [manifestPath, setManifestPath] = useState("");
   const [trustedKeyIds, setTrustedKeyIds] = useState("");
   const [operatorDraft, setOperatorDraft] = useState(operatorName);
+  const [vmixSaveResult, setVmixSaveResult] = useState<"saving" | "ok" | "fail" | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [configMessage, setConfigMessage] = useState<string | null>(null);
+
+  const saveCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Watch vmixStatus after save+check, surface a transient banner. Cancels the
+  // fallback fail-timer as soon as the status transitions out of "saving" so
+  // a late backend response can't flip ok → fail.
+  useEffect(() => {
+    if (vmixSaveResult !== "saving") return;
+    const ok = vmixStatus?.state === "connected" || vmixStatus?.state === "ready";
+    if (ok) {
+      if (saveCheckTimerRef.current) {
+        clearTimeout(saveCheckTimerRef.current);
+        saveCheckTimerRef.current = null;
+      }
+      setVmixSaveResult("ok");
+    } else if (vmixStatus?.state === "offline" || vmixStatus?.state === "degraded") {
+      if (saveCheckTimerRef.current) {
+        clearTimeout(saveCheckTimerRef.current);
+        saveCheckTimerRef.current = null;
+      }
+      setVmixSaveResult("fail");
+    }
+  }, [vmixStatus?.state, vmixStatus?.checkedAtMs, vmixSaveResult]);
+
+  useEffect(() => {
+    if (vmixSaveResult !== "ok" && vmixSaveResult !== "fail") return;
+    const t = setTimeout(() => setVmixSaveResult(null), 4000);
+    return () => clearTimeout(t);
+  }, [vmixSaveResult]);
+
+  const handleSaveAndCheckVmix = () => {
+    onSaveVmixConfig?.(draft);
+    setVmixSaveResult("saving");
+    onCheckVmix?.();
+    if (saveCheckTimerRef.current) clearTimeout(saveCheckTimerRef.current);
+    saveCheckTimerRef.current = setTimeout(() => {
+      setVmixSaveResult((cur) => (cur === "saving" ? "fail" : cur));
+      saveCheckTimerRef.current = null;
+    }, 2000);
+  };
+
+  const handleExportConfig = async () => {
+    setConfigMessage(null);
+    try {
+      const json = await exportOperatorConfig();
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `aletheia-config-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setConfigMessage("Config exported. Secrets were redacted.");
+    } catch (err) {
+      setConfigMessage(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleImportConfig = async () => {
+    setConfigMessage(null);
+    try {
+      await importOperatorConfig(importText);
+      setConfigMessage("Config imported. Re-enter passwords for adapters that use auth.");
+      setShowImportModal(false);
+      setImportText("");
+    } catch (err) {
+      setConfigMessage(`Import failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
   const vmixTone = statusTone(vmixStatus.state);
   const obsTone = statusTone(obsStatus?.state ?? "offline");
   const ppTone = statusTone(proPresenterStatus?.state ?? "offline");
@@ -311,8 +388,24 @@ export function IntegrationsSettings({
               </p>
             </div>
 
+            {vmixSaveResult && (
+              <p
+                className={`mt-3 text-xs ${
+                  vmixSaveResult === "ok"
+                    ? "text-emerald-300"
+                    : vmixSaveResult === "fail"
+                    ? "text-amber-300"
+                    : "text-muted"
+                }`}
+                aria-live="polite"
+              >
+                {vmixSaveResult === "saving" && "Saving and verifying…"}
+                {vmixSaveResult === "ok" && "✓ Saved & verified."}
+                {vmixSaveResult === "fail" && `⚠ Saved, but check failed: ${vmixStatus.detail}`}
+              </p>
+            )}
             <div className="mt-5 grid grid-cols-2 gap-2 border-t border-white/5 pt-5">
-              <ActionButton tone="secondary" onClick={() => onSaveVmixConfig?.(draft)}>
+              <ActionButton tone="secondary" onClick={handleSaveAndCheckVmix}>
                 Save config
               </ActionButton>
               <ActionButton tone="secondary" onClick={onCheckVmix}>
@@ -575,6 +668,35 @@ export function IntegrationsSettings({
                 <ActionButton className="mt-4 w-full" tone="secondary" onClick={onExportBoothPack}>
                   Export booth pack
                 </ActionButton>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <ActionButton tone="secondary" onClick={() => void handleExportConfig()}>
+                    Export config
+                  </ActionButton>
+                  <ActionButton tone="secondary" onClick={() => setShowImportModal(true)}>
+                    Import config
+                  </ActionButton>
+                </div>
+                {configMessage && (
+                  <p className="mt-2 text-xs text-muted" aria-live="polite">{configMessage}</p>
+                )}
+                {showImportModal && (
+                  <div className="mt-3 rounded-[6px] border border-white/10 bg-paper p-3">
+                    <p className="text-xs font-semibold text-ink">Paste config JSON</p>
+                    <textarea
+                      value={importText}
+                      onChange={(e) => setImportText(e.target.value)}
+                      rows={6}
+                      className="mt-2 w-full rounded-[6px] border border-white/10 bg-mist p-2 text-xs font-mono text-ink outline-none focus:border-accent"
+                      placeholder='{"version":1, ...}'
+                    />
+                    <div className="mt-2 flex gap-2">
+                      <ActionButton onClick={() => void handleImportConfig()}>Apply</ActionButton>
+                      <ActionButton tone="secondary" onClick={() => { setShowImportModal(false); setImportText(""); }}>
+                        Cancel
+                      </ActionButton>
+                    </div>
+                  </div>
+                )}
                 {boothPackExport ? (
                   <div className="mt-4 rounded-[6px] border border-white/5 bg-paper p-3">
                     <p className="break-words font-mono text-xs text-ink">{boothPackExport.path}</p>

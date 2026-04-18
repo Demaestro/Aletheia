@@ -42,6 +42,7 @@ const ClipEdlPanel = lazy(() =>
 );
 import { manualSearchResults, screenOrder, themes } from "./data/production";
 import { useDesktopStore } from "./store/useDesktopStore";
+import { useThemeStore, hydrateThemeFromKv } from "./store/useThemeStore";
 import { useHardwareStore } from "./store/useHardwareStore";
 import { useTranslationStore, hydrateTranslationFromKv } from "./store/useTranslationStore";
 import { hydrateServicePlanFromKv } from "./store/useServicePlanStore";
@@ -171,6 +172,24 @@ export default function App() {
   const hw = useHardwareStore();
   const translation = useTranslationStore();
 
+  // Apply theme mode (light/dark/system) to document root. When the operator
+  // selects "system", honour `prefers-color-scheme` and listen for OS-level
+  // changes so the broadcast booth follows ambient lighting overrides.
+  const themeMode = useThemeStore((s) => s.themeMode);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    if (themeMode !== "system") {
+      root.setAttribute("data-theme", themeMode);
+      return;
+    }
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => root.setAttribute("data-theme", mql.matches ? "dark" : "light");
+    apply();
+    mql.addEventListener("change", apply);
+    return () => mql.removeEventListener("change", apply);
+  }, [themeMode]);
+
   // Auto-route detected languages into the translation target list whenever
   // a fresh AI-detection result arrives (no-op if the operator left the
   // "auto-route" toggle off).
@@ -201,6 +220,7 @@ export default function App() {
         hydrateSongLibraryFromKv(),
         hydrateStreamOverlayFromKv(),
         hydrateTranslationFromKv(),
+        hydrateThemeFromKv(),
       ]);
     })();
   }, []);

@@ -29,7 +29,8 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/bibles/*.json"
+      "resources/bibles/*.json",
+      "resources/models/*"
     ],
     "icon": [
       "icons/32x32.png",

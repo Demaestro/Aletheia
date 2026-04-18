@@ -120,6 +120,26 @@ impl AletheiaStore {
         Ok(())
     }
 
+    /// Deletes a translation and all its verses (verses, FTS rows, registry).
+    /// Returns the number of verse rows deleted. Atomic: rolled back on error.
+    pub fn delete_translation(&self, translation_id: &str) -> StoreResult<u32> {
+        let tx = self.connection.unchecked_transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM scripture_verses WHERE translation_id = ?1",
+            params![translation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM scripture_verses_fts WHERE translation_id = ?1",
+            params![translation_id],
+        )?;
+        tx.execute(
+            "DELETE FROM translations WHERE id = ?1",
+            params![translation_id],
+        )?;
+        tx.commit()?;
+        Ok(removed as u32)
+    }
+
     /// Counts verses for a translation (used to detect partial seed states).
     pub fn count_verses_for_translation(&self, translation_id: &str) -> StoreResult<i64> {
         let count: i64 = self.connection.query_row(

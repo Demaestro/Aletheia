@@ -2,10 +2,41 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
   font-family: Outfit, Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
   background: #020617;
+
+  /* Design tokens — consumed by tailwind.config.ts colors.* via var(). */
+  --c-ink: #F8FAFC;
+  --c-graphite: #94A3B8;
+  --c-muted: #64748B;
+  --c-line: #1E293B;
+  --c-mist: #0F172A;
+  --c-paper: #020617;
+  --c-accent: #8B5CF6;
+  --c-caution: #F59E0B;
+  --c-danger: #EF4444;
+  --c-app-bg: #020617;
+  --c-app-fg: #F8FAFC;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  background: #F8FAFC;
+
+  --c-ink: #0F172A;
+  --c-graphite: #334155;
+  --c-muted: #475569;
+  --c-line: #E2E8F0;
+  --c-mist: #F1F5F9;
+  --c-paper: #FFFFFF;
+  --c-accent: #7C3AED;
+  --c-caution: #D97706;
+  --c-danger: #DC2626;
+  --c-app-bg: #F8FAFC;
+  --c-app-fg: #0F172A;
 }
 
 * {
@@ -20,9 +51,10 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #020617;
-  color: #F8FAFC;
+  background: var(--c-app-bg);
+  color: var(--c-app-fg);
   text-rendering: geometricPrecision;
+  transition: background 200ms ease, color 200ms ease;
 }
 
 button,

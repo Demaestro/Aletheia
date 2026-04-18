@@ -2,6 +2,7 @@ import { CheckCircle2, Contrast, Languages, Type, type LucideIcon } from "lucide
 import { themes } from "../data/production";
 import type { ScriptureCandidate, ThemePreset } from "../types";
 import { ActionButton, OutputCanvas, SectionHeader, StatusPill, cn } from "./Primitives";
+import { useThemeStore, type ThemeMode } from "../store/useThemeStore";
 
 export function ThemeDesigner({
   selectedTheme,
@@ -14,6 +15,13 @@ export function ThemeDesigner({
   preview: ScriptureCandidate;
   onPublish?: (theme: ThemePreset) => void;
 }) {
+  const themeMode = useThemeStore((s) => s.themeMode);
+  const setThemeMode = useThemeStore((s) => s.setThemeMode);
+  const modeOptions: { id: ThemeMode; label: string }[] = [
+    { id: "light", label: "Light" },
+    { id: "dark", label: "Dark" },
+    { id: "system", label: "System" }
+  ];
   return (
     <section className="space-y-7">
       <SectionHeader
@@ -22,6 +30,26 @@ export function ThemeDesigner({
         detail="Theme controls validate safe area, minimum text size, contrast, and multilingual fallback before a style can be published."
         action={<ActionButton onClick={() => onPublish?.(selectedTheme)}>Publish theme</ActionButton>}
       />
+
+      <div className="rounded-[6px] border border-white/5 bg-white/5 p-4">
+        <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted">App appearance</p>
+        <div className="mt-3 inline-flex rounded-[6px] border border-white/5 bg-paper p-1">
+          {modeOptions.map((opt) => (
+            <button
+              key={opt.id}
+              type="button"
+              onClick={() => setThemeMode(opt.id)}
+              className={cn(
+                "rounded-[4px] px-4 py-1.5 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent",
+                themeMode === opt.id ? "bg-accent text-white" : "text-muted hover:text-ink"
+              )}
+              aria-pressed={themeMode === opt.id}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <div className="grid gap-5 xl:grid-cols-[340px_minmax(0,1fr)_420px]">
         <div className="space-y-3">

@@ -188,6 +188,34 @@ export async function importBibleTranslation(
   );
 }
 
+/** Deletes a translation and all its verses. Returns rows removed. */
+export async function deleteBibleTranslation(translationId: string): Promise<number> {
+  if (!isTauriRuntime()) {
+    throw new Error("Bible delete requires the desktop runtime.");
+  }
+  return invokeWithTimeout<number>(
+    "delete_bible_translation",
+    { translationId },
+    SLOW_OP_TIMEOUT_MS
+  );
+}
+
+/** Exports operator + integration config as a JSON string. Secrets are redacted. */
+export async function exportOperatorConfig(): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("Config export requires the desktop runtime.");
+  }
+  return invokeWithTimeout<string>("export_operator_config");
+}
+
+/** Imports operator + integration config from a JSON string. */
+export async function importOperatorConfig(json: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("Config import requires the desktop runtime.");
+  }
+  await invokeWithTimeout<null>("import_operator_config", { json });
+}
+
 /**
  * Returns the names of all audio input devices visible to the OS.
  * Use this to populate an audio device picker dropdown.

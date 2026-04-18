@@ -2479,8 +2479,19 @@ fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
 // Audio capture + offline STT commands
 // ---------------------------------------------------------------------------
 
-/// Returns the path to the best available STT model in the offline-assets dir.
+/// Returns the path to the best available STT model.
+///
+/// Checks the bundled installer-resource directory first (for the ggml-base.en
+/// model dropped into `src-tauri/resources/models/` at build time), then falls
+/// back to user-installed model packs in the offline-assets directory.
 pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
+    // Bundled-resource search hint, set once at app start by `setup()`.
+    if let Some(resource_dir) = bundled_resource_dir() {
+        let bundled = resource_dir.join("resources/models/ggml-base.en.bin");
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+    }
     // Prefer English-only model, then fall back to any multilingual pack.
     let candidates = [
         "stt-whisper-en-small.bin",
@@ -2501,6 +2512,20 @@ pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
         }
     }
     Err("No offline STT model installed. Install model packs via Health → Offline Model Packs.".to_string())
+}
+
+// `OnceLock` cell for the installer's bundled-resource directory. Populated
+// once at startup from `setup()` so `find_stt_model_path` can locate the
+// auto-bundled `ggml-base.en.bin` without threading the path through every
+// call site.
+static BUNDLED_RESOURCE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_bundled_resource_dir(path: PathBuf) {
+    let _ = BUNDLED_RESOURCE_DIR.set(path);
+}
+
+pub fn bundled_resource_dir() -> Option<&'static Path> {
+    BUNDLED_RESOURCE_DIR.get().map(|p| p.as_path())
 }
 
 
@@ -2556,9 +2581,66 @@ pub fn run() {
             let app_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_dir)?;
             let database_path = app_dir.join("aletheia.sqlite3");
+
+            // Populate the bundled-resource directory hint BEFORE state open /
+            // manage so any early path that resolves the STT model (audit
+            // seeding, health checks triggered during hydration) can find the
+            // bundled `ggml-base.en.bin` from the installer resources dir.
+            if let Ok(resource_dir_early) = app.path().resource_dir() {
+                set_bundled_resource_dir(resource_dir_early);
+            }
+
             let desktop_state = DesktopState::open(database_path.clone())
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::Other, message))?;
             app.manage(desktop_state);
+
+            // vMix auto-reconnect: every N seconds (exponential backoff 10s..5min)
+            // probe the adapter; on offline/degraded re-evaluate via check_status,
+            // which re-runs the HTTP probe and effectively "reconnects". Emit
+            // `aletheia://vmix-reconnect` so the UI can surface attempts.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::time::Duration;
+                    const MIN_DELAY_MS: u64 = 10_000;
+                    const MAX_DELAY_MS: u64 = 5 * 60 * 1000;
+                    let mut delay_ms: u64 = MIN_DELAY_MS;
+                    let mut attempt: u32 = 0;
+                    let mut last_state = String::new();
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let probe_handle = app_handle.clone();
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            let state = probe_handle.state::<DesktopState>();
+                            let adapter = state.lock_vmix().ok()?;
+                            Some(aletheia_output::OutputAdapter::status(&*adapter).health)
+                        }).await.ok().flatten();
+                        let (state_str, _detail) = match result {
+                            Some(h) => crate::output_health_to_state_detail(h),
+                            None => ("offline".to_string(), "vMix probe unavailable".to_string()),
+                        };
+                        let needs_retry = matches!(state_str.as_str(), "offline" | "degraded");
+                        if needs_retry {
+                            attempt = attempt.saturating_add(1);
+                            delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                        } else {
+                            attempt = 0;
+                            delay_ms = MIN_DELAY_MS;
+                        }
+                        // Emit only on state transition or while actively retrying.
+                        // Avoids a steady stream of "still healthy" events to the UI.
+                        if state_str != last_state || needs_retry {
+                            let payload = serde_json::json!({
+                                "state": state_str,
+                                "attempt": attempt,
+                                "nextRetryMs": delay_ms,
+                            });
+                            let _ = tauri::Emitter::emit(&app_handle, "aletheia://vmix-reconnect", payload);
+                            last_state = state_str;
+                        }
+                    }
+                });
+            }
 
             // Auto-import bundled full-Bible JSON files on first launch (and on
             // upgrades that ship updated translations). Runs in the background
@@ -2679,7 +2761,10 @@ pub fn run() {
             kv_set,
             kv_delete,
             kv_list_keys,
-            list_audio_devices
+            list_audio_devices,
+            delete_bible_translation,
+            export_operator_config,
+            import_operator_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aletheia desktop shell");

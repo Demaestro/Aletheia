@@ -2,3 +2,7 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# Whisper model binaries are too large for git — they are bundled into the
+# installer at build time but must be dropped here manually by the developer.
+resources/models/*.bin
