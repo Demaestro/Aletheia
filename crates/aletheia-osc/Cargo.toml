@@ -1,0 +1,16 @@
+[package]
+name = "aletheia-osc"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "OSC 1.0 UDP output adapter for Aletheia worship production"
+
+[lints]
+workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+aletheia-output = { path = "../aletheia-output" }
+serde = { version = "1.0", features = ["derive"] }

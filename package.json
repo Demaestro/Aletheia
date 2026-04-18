@@ -1,0 +1,48 @@
+{
+  "name": "aletheia-production-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev --config src-tauri/tauri.conf.dev.json",
+    "desktop:launch": "node scripts/dev.mjs",
+    "desktop:build": "tauri build --bundles deb,rpm",
+    "desktop:build:linux": "tauri build --bundles deb,rpm",
+    "desktop:build:windows": "tauri build --bundles msi,nsis",
+    "desktop:build:all": "tauri build",
+    "smoke:production-ui": "node scripts/smoke-production-ui.mjs",
+    "verify:production": "./scripts/verify-production.sh"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/cli-win32-x64-msvc": "^2.10.1",
+    "@vitejs/plugin-react": "^5.0.0",
+    "framer-motion": "^12.0.0",
+    "i18next": "^26.0.5",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-error-boundary": "^6.1.1",
+    "react-i18next": "^17.0.3",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.20",
+    "babel-plugin-react-compiler": "^1.0.0",
+    "playwright": "^1.59.1",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.1"
+  }
+}

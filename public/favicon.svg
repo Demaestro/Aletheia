@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Aletheia">
+  <rect width="64" height="64" rx="12" fill="#050505"/>
+  <path d="M17 18h19c6.08 0 11 4.92 11 11v17H28c-6.08 0-11-4.92-11-11V18Z" fill="#157A5C"/>
+  <path d="M24 25h16M24 32h13M24 39h9" stroke="#F7F8F8" stroke-width="4" stroke-linecap="round"/>
+</svg>

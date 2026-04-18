@@ -1,0 +1,19 @@
+[package]
+name = "aletheia-obs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "OBS WebSocket v5 output adapter for Aletheia worship production"
+
+[lints]
+workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+aletheia-output = { path = "../aletheia-output" }
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

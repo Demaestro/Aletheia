@@ -1,0 +1,19 @@
+[package]
+name = "aletheia-audio-ingest"
+description = "Audio ingest state machine and capture contracts for Aletheia."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+aletheia-vad = { path = "../aletheia-vad" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+

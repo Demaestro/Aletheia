@@ -1,0 +1,18 @@
+[package]
+name = "aletheia-vmix"
+description = "vMix HTTP API adapter for Aletheia output scenes."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+aletheia-output = { path = "../aletheia-output" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,135 @@
+name: Release
+
+# Triggers when you push a version tag, e.g.  git tag v0.2.0 && git push --tags
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+# Only one release job can run at a time; newer tag cancels a pending one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows x64 — produces .msi installer + update JSON
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build and sign Tauri app
+        run: npm run tauri build
+        env:
+          # Set these secrets in: GitHub repo → Settings → Secrets → Actions
+          # TAURI_SIGNING_PRIVATE_KEY  — base64-encoded contents of your .pfx file
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD  — password for the .pfx
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload release artefacts
+        uses: softprops/action-gh-release@v2
+        with:
+          # Publish as a draft so you can review before it goes public.
+          draft: true
+          fail_on_unmatched_files: false
+          files: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/updater/*.json
+            src-tauri/target/release/bundle/updater/*.sig
+
+  # ---------------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon) + x64 — produces .dmg installer
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (universal binary)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build universal macOS binary
+        run: npm run tauri build -- --target universal-apple-darwin
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple notarisation — optional but removes "unidentified developer" warning
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Upload release artefacts
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: false
+          files: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/updater/*.json
+            src-tauri/target/universal-apple-darwin/release/bundle/updater/*.sig
+
+  # ---------------------------------------------------------------------------
+  # Publish the draft once both platform builds succeed
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Promote draft to published release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false

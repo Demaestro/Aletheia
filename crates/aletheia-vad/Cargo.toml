@@ -1,0 +1,18 @@
+[package]
+name = "aletheia-vad"
+description = "Hybrid voice activity detection for Nigerian church production conditions."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aletheia-core = { path = "../aletheia-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+

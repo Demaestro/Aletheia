@@ -1,0 +1,15 @@
+[package]
+name = "aletheia-core"
+description = "Shared local-first domain contracts, events, and state models for Aletheia."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+

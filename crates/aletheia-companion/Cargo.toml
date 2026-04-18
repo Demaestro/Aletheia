@@ -1,0 +1,17 @@
+[package]
+name = "aletheia-companion"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Bitfocus Companion HTTP control output adapter for Aletheia worship production"
+
+[lints]
+workspace = true
+
+[dependencies]
+aletheia-core   = { path = "../aletheia-core" }
+aletheia-output = { path = "../aletheia-output" }
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

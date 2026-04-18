@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+.zig-cache/
+output/
+.playwright-cli/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

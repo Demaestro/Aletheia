@@ -1,0 +1,18 @@
+[env]
+ALETHEIA_MUSL_TARGET = "x86_64-unknown-linux-musl"
+# Needed by whisper-rs-sys bindgen to locate libclang.dll
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+# Use the bundled src/bindings.rs that ships with whisper-rs-sys instead of
+# running bindgen at build time — avoids MSVC include-path issues on Windows.
+WHISPER_DONT_GENERATE_BINDINGS = "1"
+
+# Redirect build artifacts outside OneDrive — the [build] key is what cargo
+# actually reads; CARGO_TARGET_DIR in [env] only reaches build scripts.
+[build]
+target-dir = "C:\\Users\\USER\\cargo-targets\\worship-production-interface"
+
+# On Windows/Git-Bash, /usr/bin/link (a symlink tool) shadows MSVC link.exe.
+# Pin the MSVC linker explicitly so cargo always finds the right one.
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
+

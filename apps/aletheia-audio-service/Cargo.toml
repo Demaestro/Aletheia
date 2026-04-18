@@ -1,0 +1,23 @@
+[package]
+name = "aletheia-audio-service"
+description = "Local audio ingest process for Aletheia."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aletheia-audio-ingest = { path = "../../crates/aletheia-audio-ingest" }
+aletheia-core = { path = "../../crates/aletheia-core" }
+aletheia-detection = { path = "../../crates/aletheia-detection" }
+aletheia-output = { path = "../../crates/aletheia-output" }
+aletheia-vad = { path = "../../crates/aletheia-vad" }
+
+[[bin]]
+name = "aletheia-audio-service"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
