@@ -128,7 +128,7 @@ impl CompanionAdapter {
         // Probing internal/current_time (which usually exists)
         // prevents a valid 404 on an unconfigured custom variable from failing health checks.
         let path = "/api/variables/internal/current_time";
-        let response = self.request("GET", &path, None)?;
+        let response = self.request("GET", path, None)?;
         // 404 still proves the HTTP server is alive; treat 4xx other than 401/403
         // as "reachable but the variable is not configured yet".
         if response.status_code == 401 || response.status_code == 403 {
