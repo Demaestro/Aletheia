@@ -1,7 +1,7 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 
-const LOCALE_STORAGE_KEY = "aletheia.locale";
+const LOCALE_STORAGE_KEY = "aletheia:locale";
 const SUPPORTED = ["en", "ig", "yo", "ha"] as const;
 type Locale = (typeof SUPPORTED)[number];
 
@@ -32,7 +32,47 @@ const resources = {
       check: "Check",
       import: "Import",
       export: "Export",
-      delete: "Delete"
+      delete: "Delete",
+      runCheck: "Run pre-service check",
+      runRehearsal: "Run local rehearsal",
+      runAiAssist: "Run AI assist",
+      approvePreview: "Approve to preview"
+    },
+    dashboard: {
+      eyebrow: "Operator dashboard",
+      title: "Current service state",
+      detail: "The dashboard keeps the next safe action visible: listen, verify, preview, then send live.",
+      sourceMap: "Source map",
+      aiAssist: "AI scripture assist",
+      aiDecision: "AI decision",
+      multilingualRouting: "Multilingual routing",
+      detectedLanguages: "Detected languages",
+      accuracyTarget: "Accuracy target",
+      latestTranscript: "Latest transcript",
+      destinationReadiness: "Destination readiness"
+    },
+    health: {
+      eyebrow: "Offline and health",
+      title: "Know what still works before the service starts",
+      detail: "The health panel prioritizes blocking issues first and translates technical failures into operator actions.",
+      offlineReadiness: "Offline readiness",
+      acceptanceTesting: "Device acceptance testing",
+      offlinePack: "Offline distribution pack",
+      offlineAssets: "Offline assets",
+      productionReadiness: "Production readiness",
+      releaseGates: "Release gates",
+      rehearsalRunner: "Local rehearsal runner",
+      securityBlockers: "Security blockers",
+      supportBundle: "Support bundle",
+      deviceSummary: "Device summary",
+      lowBandwidth: "Low-bandwidth policy"
+    },
+    integrations: {
+      eyebrow: "Output adapters",
+      title: "Where scripture goes when you press Live",
+      vmixBridge: "vMix bridge",
+      operatorName: "Operator identity",
+      adapterPolicy: "Adapter policy"
     }
   },
   ig: {
@@ -61,7 +101,47 @@ const resources = {
       check: "Lelee",
       import: "Bubata",
       export: "Bupụ",
-      delete: "Hichapụ"
+      delete: "Hichapụ",
+      runCheck: "Mee Nlele Tupu Ozi",
+      runRehearsal: "Gaa Próva Ebe A",
+      runAiAssist: "Mee Nkwado AI",
+      approvePreview: "Kwado maka Nlele"
+    },
+    dashboard: {
+      eyebrow: "Ngwaọrụ Onye Ọrụ",
+      title: "Ọnọdụ Ozi Ugbu a",
+      detail: "Ngwaọrụ na-egosi ọrụ na-abata ọzọ: nụ, lelee, nlele, wee zipu ndụ.",
+      sourceMap: "Ihe Isi Ozuzo",
+      aiAssist: "Nkwado AI Akwụkwọ Nsọ",
+      aiDecision: "Mkpebi AI",
+      multilingualRouting: "Ụzọ Asụsụ Dị Iche Iche",
+      detectedLanguages: "Asụsụ A Chọpụtara",
+      accuracyTarget: "Ebumnuche Izi Ezi",
+      latestTranscript: "Ndepụta Ikpeazụ",
+      destinationReadiness: "Nkwadebe Ebe Mgbasa"
+    },
+    health: {
+      eyebrow: "Ahụike Ntanetị",
+      title: "Mara ihe na-arụ ọrụ tupu ozi amalite",
+      detail: "Ihe ngosi ahụike na-etinye nsogbu ndọgbu ụzọ mbụ.",
+      offlineReadiness: "Nkwadebe Ntanetị",
+      acceptanceTesting: "Nnwale Ụlọ Ọrụ",
+      offlinePack: "Ngwugwu Ọrụ n'oge Ntanetị",
+      offlineAssets: "Akụ Ntanetị",
+      productionReadiness: "Nkwadebe Mmepụta",
+      releaseGates: "Ọnụ Ụzọ Ntọhapụ",
+      rehearsalRunner: "Próva Ebe A",
+      securityBlockers: "Mgbochi Nchedo",
+      supportBundle: "Ngwugwu Nkwado",
+      deviceSummary: "Nchịkọta Ngwaọrụ",
+      lowBandwidth: "Iwu Ọnụ Ụzọ Ntakịrị"
+    },
+    integrations: {
+      eyebrow: "Ngwa Mmepụta",
+      title: "Ebe Akwụkwọ Nsọ na-aga mgbe ị naanya Ndụ",
+      vmixBridge: "Ngịga vMix",
+      operatorName: "Njirimara Onye Ọrụ",
+      adapterPolicy: "Iwu Ngwa"
     }
   },
   yo: {
@@ -90,7 +170,47 @@ const resources = {
       check: "Ṣàyẹ̀wò",
       import: "Mú Wọlé",
       export: "Gbé Jáde",
-      delete: "Parẹ́"
+      delete: "Parẹ́",
+      runCheck: "Ṣe Àyẹ̀wò Ìṣáájú-Ìsìn",
+      runRehearsal: "Ṣe Àdánwò Ìbílẹ̀",
+      runAiAssist: "Ṣe Ìrànlọ́wọ́ AI",
+      approvePreview: "Fọwọ́sí fún Àyẹ̀wò"
+    },
+    dashboard: {
+      eyebrow: "Pẹpẹ Olùṣakoso",
+      title: "Ipo Ìsìn Lọ́wọ́lọ́wọ́",
+      detail: "Pẹpẹ náà ń fi ìgbésẹ̀ àbò kó sí ìwò: gbọ́, ṣàyẹ̀wò, ìwo àyẹ̀wò, lẹ́hìnnà fi ránṣẹ́.",
+      sourceMap: "Mápù Òrisun",
+      aiAssist: "Ìrànlọ́wọ́ AI Ìwé Mímọ́",
+      aiDecision: "Ìpinnu AI",
+      multilingualRouting: "Ìtọ́sọ́nà Èdè Pọ̀",
+      detectedLanguages: "Àwọn Èdè Tí A Mọ̀",
+      accuracyTarget: "Àfojúsùn Ìpéye",
+      latestTranscript: "Àkọsílẹ̀ Tó Gbẹ̀yìn",
+      destinationReadiness: "Ìmúrasílẹ̀ Ìdojúkọ"
+    },
+    health: {
+      eyebrow: "Ìlera Aláìsí Íńtánẹ́tì",
+      title: "Mọ ohun tó ṣiṣẹ́ ṣáájú ìsìn",
+      detail: "Àgbékalẹ̀ ìlera máa ń fi àwọn ìṣòro tó ń dínà sí iwájú.",
+      offlineReadiness: "Ìmúrasílẹ̀ Aláìsí Íńtánẹ́tì",
+      acceptanceTesting: "Ìdánwò Ìgbàwọlé Ẹ̀rọ",
+      offlinePack: "Àpò Ìpínpín Aláìsí Íńtánẹ́tì",
+      offlineAssets: "Àwọn Ohun-Ìní Aláìsí",
+      productionReadiness: "Ìmúrasílẹ̀ Iṣẹ́",
+      releaseGates: "Ẹ̀nubọ̀dé Ìtẹ̀síwájú",
+      rehearsalRunner: "Àdánwò Ìbílẹ̀",
+      securityBlockers: "Àwọn Àdínà Ààbò",
+      supportBundle: "Àpò Ìrànlọ́wọ́",
+      deviceSummary: "Àkọóròyìn Ẹ̀rọ",
+      lowBandwidth: "Ìlànà Ìgbéká Kékeré"
+    },
+    integrations: {
+      eyebrow: "Àwọn Adapta Àbájáde",
+      title: "Ibo Ìwé Mímọ́ Ń lọ Nígbà Tí O Tẹ Tààrà",
+      vmixBridge: "Afárá vMix",
+      operatorName: "Ìdánimọ̀ Olùṣakoso",
+      adapterPolicy: "Ìlànà Adapta"
     }
   },
   ha: {
@@ -119,7 +239,47 @@ const resources = {
       check: "Bincika",
       import: "Shigo da",
       export: "Fitar",
-      delete: "Share"
+      delete: "Share",
+      runCheck: "Gudanar da Binciken Pre-Sabis",
+      runRehearsal: "Gudanar da Gwajin Gida",
+      runAiAssist: "Gudanar da Taimakon AI",
+      approvePreview: "Amince don Duba"
+    },
+    dashboard: {
+      eyebrow: "Allon Ma'aikaci",
+      title: "Yanayin Sabis na Yanzu",
+      detail: "Allon yana nuna aikin da ya fi aminci: saurara, tabbatar, duba, sannan aika kai tsaye.",
+      sourceMap: "Taswira Madogara",
+      aiAssist: "Taimakon AI na Nassosi",
+      aiDecision: "Shawarar AI",
+      multilingualRouting: "Tsarin Shimfiɗa Harsuna",
+      detectedLanguages: "Harsuna da aka Gano",
+      accuracyTarget: "Manufar Daidaito",
+      latestTranscript: "Rubuce-rubuce na Ƙarshe",
+      destinationReadiness: "Shirye-shiryen Inda za a Aika"
+    },
+    health: {
+      eyebrow: "Lafiyar Layi",
+      title: "San abin da ke aiki kafin sabis ya fara",
+      detail: "Hukumar Lafiya tana sanya matsalolin da ke toshe aiki a gaba.",
+      offlineReadiness: "Shirye-shiryen Layi",
+      acceptanceTesting: "Gwajin Karɓar Na'ura",
+      offlinePack: "Fakitin Rarraba Layi",
+      offlineAssets: "Kadarori na Layi",
+      productionReadiness: "Shirye-shiryen Samarwa",
+      releaseGates: "Ƙofofin Saki",
+      rehearsalRunner: "Gwajin Gida",
+      securityBlockers: "Masu Toshe Tsaro",
+      supportBundle: "Fakitin Tallafi",
+      deviceSummary: "Taƙaitaccen Ba'ana Na'ura",
+      lowBandwidth: "Manufar Bandwith Ƙarami"
+    },
+    integrations: {
+      eyebrow: "Adaftocin Fitarwa",
+      title: "Inda Nassosi ke Tafiya Lokacin da ka Latsa Kai Tsaye",
+      vmixBridge: "Gadiyar vMix",
+      operatorName: "Shaida Ma'aikaci",
+      adapterPolicy: "Manufar Adafta"
     }
   }
 };

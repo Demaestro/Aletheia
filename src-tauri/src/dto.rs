@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use aletheia_ops::RedactionSummary;
 
 #[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
@@ -19,7 +19,7 @@ pub struct BibleTranslationStatusDto {
     pub full_canon: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../../src/gen/")]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptureCandidateDto {
@@ -32,9 +32,26 @@ pub struct ScriptureCandidateDto {
     pub source: String,
     pub reason: String,
     pub status: String,
+    /// True when this candidate was synthesized for first-run UX (no live
+    /// session yet). The UI surfaces a "DEMO" pill so operators can tell
+    /// placeholder rows apart from real detections.
+    #[serde(default)]
+    pub is_demo: bool,
+    /// True when ambiguity prevented a unique resolution (e.g. bare
+    /// "Chronicles 7:14" matches both 1 Chr and 2 Chr); the UI offers
+    /// `disambiguation_options` as chips instead of auto-picking.
+    #[serde(default)]
+    pub needs_disambiguation: bool,
+    #[serde(default)]
+    pub disambiguation_options: Vec<String>,
+    /// Lookup status — `"ok"`, `"missing_translation"`, `"placeholder"`.
+    /// Only set on live-detection candidates so the UI can show ⚠ when text
+    /// is empty for a real reason instead of a blank cell.
+    #[serde(default)]
+    pub lookup_status: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../../src/gen/")]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptSegmentDto {
@@ -45,6 +62,10 @@ pub struct TranscriptSegmentDto {
     pub text: String,
     pub confidence: u8,
     pub latency_ms: u32,
+    /// True when this segment is placeholder data shown before any real
+    /// audio capture has produced output. Surfaced by the UI as a "DEMO" pill.
+    #[serde(default)]
+    pub is_demo: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
@@ -446,6 +467,88 @@ pub struct CaptureStatusDto {
     pub model_path: Option<String>,
 }
 
+/// Snapshot of the offline Whisper STT engine for the operator-facing
+/// "Capture control" panel. Surfaces whether a model file was found, whether
+/// it has been loaded into memory, the file path the operator should drop
+/// new models alongside, and (when load failed) the reason — so the operator
+/// is never left guessing why no transcript appears.
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct SttStatusDto {
+    /// True when an `OfflineSttAdapter` instance is loaded in memory.
+    pub model_loaded: bool,
+    /// Resolved path of the model file currently loaded (or that would be
+    /// loaded on the next `reload_stt_model` call).
+    pub model_path: Option<String>,
+    /// Filename only — convenient for display ("ggml-base.en.bin").
+    pub model_filename: Option<String>,
+    /// The directory the operator should drop additional model files into.
+    pub asset_root: Option<String>,
+    /// Last load error, if any, to display to the operator.
+    pub load_error: Option<String>,
+}
+
+/// Live candidate surfaced from the capture/detection pipeline.
+/// Emitted over the `aletheia://scripture-candidate` Tauri event and also
+/// persisted in the `scripture_candidates` table.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct LiveScriptureCandidateDto {
+    pub id: String,
+    pub session_id: String,
+    pub segment_id: String,
+    pub reference: String,
+    pub translation_id: String,
+    pub language: String,
+    pub score: f32,
+    pub bucket: String,
+    pub status: String,
+    pub reason: String,
+    pub verse_text: String,
+    pub created_at_ms: u64,
+    /// `"ok"` — verse text resolved from the local KJV table.
+    /// `"missing_translation"` — translation/book/chapter/verse not in DB.
+    /// `"placeholder"` — generic detector fallback string.
+    #[serde(default)]
+    pub lookup_status: String,
+    /// True when the live candidate could match more than one canonical book
+    /// (e.g. bare "Chronicles 7:14"). UI shows disambiguation chips.
+    #[serde(default)]
+    pub needs_disambiguation: bool,
+    #[serde(default)]
+    pub disambiguation_options: Vec<String>,
+}
+
+/// Operator verdict recorded against a live candidate.
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorActionDto {
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    pub action_type: String,
+    pub actor: String,
+    pub occurred_at_ms: u64,
+}
+
+/// Display event emitted whenever an output takes a candidate live, previews
+/// it, extends it, or clears the output.
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayEventDto {
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    pub action: String,
+    pub output_target: String,
+    pub triggered_by: String,
+    pub locked_at_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // CCLI usage (persisted through the chained-hash audit log)
 // ---------------------------------------------------------------------------
@@ -518,3 +621,93 @@ pub struct StreamOverlayServerStatusDto {
     pub url: Option<String>,
     pub started_at_ms: Option<u64>,
 }
+
+// ---------------------------------------------------------------------------
+// System diagnostics (operator-facing live status screen)
+// ---------------------------------------------------------------------------
+
+/// Latency statistics computed over the last N pipeline segments.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct LatencyStatsDto {
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub max_ms: u64,
+    pub sample_count: u32,
+    /// Number of segments whose end-to-end latency exceeded 3 000 ms.
+    pub breach_count: u32,
+}
+
+/// One entry in the Whisper model catalogue — describes a tier the operator
+/// can choose to install, with integrity metadata embedded in the binary.
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogueEntryDto {
+    /// File name, e.g. `"ggml-small.en.bin"`.
+    pub filename: String,
+    /// Short tier label for display, e.g. `"small"`.
+    pub quality: String,
+    /// Human-readable label, e.g. `"Small (recommended)"`.
+    pub label: String,
+    pub size_mb: u32,
+    pub ram_required_mb: u32,
+    /// Expected P95 latency on a mid-range i5, in milliseconds.
+    pub expected_latency_ms: u32,
+    pub sha256: String,
+    pub download_url: String,
+    /// True for the tier we recommend as the production minimum.
+    pub recommended: bool,
+    /// True when this exact file (matching SHA-256) is already installed.
+    pub installed: bool,
+    /// True when the installed file passes the SHA-256 check.
+    pub checksum_ok: Option<bool>,
+}
+
+/// Full system diagnostics snapshot — polled every 2 s by the diagnostics screen.
+#[derive(Clone, Debug, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../src/gen/")]
+#[serde(rename_all = "camelCase")]
+pub struct SystemDiagnosticsDto {
+    // ── Audio ──────────────────────────────────────────────────────────────
+    pub active_mic: Option<String>,
+    pub capture_running: bool,
+    pub audio_queue_depth: u32,
+
+    // ── Speech recognition ────────────────────────────────────────────────
+    pub stt_model_loaded: bool,
+    pub stt_model_filename: Option<String>,
+    /// Tier label: "tiny" | "base" | "small" | "medium" | "large"
+    pub stt_model_quality: Option<String>,
+    pub stt_model_size_mb: Option<u32>,
+    pub stt_model_checksum_ok: Option<bool>,
+
+    // ── Pipeline latency ──────────────────────────────────────────────────
+    pub latency: LatencyStatsDto,
+
+    // ── Detection engine ──────────────────────────────────────────────────
+    pub phrase_pattern_count: u32,
+    pub last_detection_reference: Option<String>,
+    pub last_detection_confidence: Option<f32>,
+    pub last_detection_bucket: Option<String>,
+    pub detections_this_session: u32,
+    pub rejected_this_session: u32,
+    pub suppressed_this_session: u32,
+
+    // ── Bible database ─────────────────────────────────────────────────────
+    pub bible_db_ok: bool,
+    pub translations_loaded: Vec<String>,
+
+    // ── Output adapters ────────────────────────────────────────────────────
+    pub vmix_state: String,
+    pub obs_state: String,
+    pub easyworship_state: String,
+    pub propresenter_state: String,
+    pub companion_state: String,
+    pub osc_state: String,
+
+    pub checked_at_ms: u64,
+}
+

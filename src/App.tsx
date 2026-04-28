@@ -1,10 +1,19 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useDeferredValue } from "react";
+import { ErrorBoundary } from "react-error-boundary";
 import { LandingPage } from "./components/LandingPage";
 import { LiveTranscriptView } from "./components/LiveTranscriptView";
+import { AudioStreamProvider } from "./contexts/AudioStreamContext";
+import { usePollingLoop } from "./hooks/usePollingLoop";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { tNavMeta } from "./utils/tNav";
 import { VuMeter } from "./components/VuMeter";
 import { PreviewLiveOutput } from "./components/PreviewLiveOutput";
 import { QueueApprovalPanel } from "./components/QueueApprovalPanel";
 import { WorkspaceShell } from "./components/WorkspaceShell";
+
+// OperatorDashboard is the default screen — import directly so the operator
+// never sees a "Loading screen…" flash on launch.
+import { OperatorDashboard } from "./components/OperatorDashboard";
 
 // Heavy/rarely-hot screens — defer until the operator navigates to them.
 const HealthStatusPanel = lazy(() =>
@@ -18,9 +27,6 @@ const ManualSearchFallback = lazy(() =>
 );
 const OnboardingFlow = lazy(() =>
   import("./components/OnboardingFlow").then((m) => ({ default: m.OnboardingFlow }))
-);
-const OperatorDashboard = lazy(() =>
-  import("./components/OperatorDashboard").then((m) => ({ default: m.OperatorDashboard }))
 );
 const ThemeDesigner = lazy(() =>
   import("./components/ThemeDesigner").then((m) => ({ default: m.ThemeDesigner }))
@@ -40,6 +46,20 @@ const FleetSyncPanel = lazy(() =>
 const ClipEdlPanel = lazy(() =>
   import("./components/ClipEdlPanel").then((m) => ({ default: m.ClipEdlPanel }))
 );
+const ServiceReportPanel = lazy(() =>
+  import("./components/ServiceReportPanel")
+);
+const TranscriptSearchPanel = lazy(() =>
+  import("./components/TranscriptSearchPanel")
+);
+const ModelDownloadWizard = lazy(() =>
+  import("./components/ModelDownloadWizard")
+);
+const DiagnosticsScreen = lazy(() =>
+  import("./components/DiagnosticsScreen").then(m => ({ default: m.DiagnosticsScreen }))
+);
+import SessionResumeBanner from "./components/SessionResumeBanner";
+
 import { manualSearchResults, screenOrder, themes } from "./data/production";
 import { useDesktopStore } from "./store/useDesktopStore";
 import { useThemeStore, hydrateThemeFromKv } from "./store/useThemeStore";
@@ -77,6 +97,8 @@ import {
   showMainWindow,
   startAudioCapture,
   listAudioDevices,
+  getSttStatus,
+  reloadSttModel,
   generateEasyWorshipSmbSetupGuide,
   getVmixTitleSetupGuide,
   stopAudioCapture,
@@ -121,6 +143,11 @@ import {
   setDestinationsArmed,
   updateVmixConfig,
   fetchVerseOnDemand,
+  approveCandidate as approveCandidateCmd,
+  rejectCandidate as rejectCandidateCmd,
+  previewCandidate as previewCandidateCmd,
+  takeCandidateLive as takeCandidateLiveCmd,
+  clearAllOutputs as clearAllOutputsCmd,
 } from "./services/desktopApi";
 import type {
   BoothPackExport,
@@ -161,15 +188,52 @@ export default function App() {
   const [rehearsalReport, setRehearsalReport] = useState<LocalRehearsalReport | null>(null);
 
   const { t } = useTranslation();
-  const activeMeta = { 
-    title: t(`navigation.${activeScreen}.title` as any, { defaultValue: activeScreen }), 
-    kicker: t(`navigation.${activeScreen}.kicker` as any) 
-  };
+  const activeMeta = useMemo(() => tNavMeta(t, activeScreen), [t, activeScreen]);
   const currentIndex = useMemo(() => screenOrder.indexOf(activeScreen), [activeScreen]);
 
-  // Zustand State hooks
-  const desktop = useDesktopStore();
-  const hw = useHardwareStore();
+  // Zustand — granular selectors to prevent whole-tree re-renders on every store mutation.
+  const candidates       = useDesktopStore(s => s.candidates);
+  const transcript       = useDesktopStore(s => s.transcript);
+  const aiDetection      = useDesktopStore(s => s.aiDetection);
+  const previewCandidate = useDesktopStore(s => s.previewCandidate);
+  const liveCandidate    = useDesktopStore(s => s.liveCandidate);
+  const selectedCandidate = useDesktopStore(s => s.selectedCandidate);
+  const destinationsArmed = useDesktopStore(s => s.destinationsArmed);
+  const desktopStatus    = useDesktopStore(s => s.desktopStatus);
+  const setCandidates    = useDesktopStore(s => s.setCandidates);
+  const setTranscript    = useDesktopStore(s => s.setTranscript);
+  const setAiDetection   = useDesktopStore(s => s.setAiDetection);
+  const mergeCandidates  = useDesktopStore(s => s.mergeCandidates);
+  const setPreviewCandidate = useDesktopStore(s => s.setPreviewCandidate);
+  const setLiveCandidate = useDesktopStore(s => s.setLiveCandidate);
+  const setSelectedCandidateAction = useDesktopStore(s => s.setSelectedCandidate);
+  const setDestinationsArmedAction = useDesktopStore(s => s.setDestinationsArmed);
+  const setDesktopStatusAction = useDesktopStore(s => s.setDesktopStatus);
+  const removeCandidate  = useDesktopStore(s => s.removeCandidate);
+
+  const integrations       = useHardwareStore(s => s.integrations);
+  const vmixStatus         = useHardwareStore(s => s.vmixStatus);
+  const obsStatus          = useHardwareStore(s => s.obsStatus);
+  const oscStatus          = useHardwareStore(s => s.oscStatus);
+  const proPresenterStatus = useHardwareStore(s => s.proPresenterStatus);
+  const companionStatus    = useHardwareStore(s => s.companionStatus);
+  const easyWorshipStatus  = useHardwareStore(s => s.easyWorshipStatus);
+  const healthItems        = useHardwareStore(s => s.healthItems);
+  const productionReadiness = useHardwareStore(s => s.productionReadiness);
+  const integrationEvents  = useHardwareStore(s => s.integrationEvents);
+  const operatorName       = useHardwareStore(s => s.operatorName);
+  const setVmixStatus      = useHardwareStore(s => s.setVmixStatus);
+  const setObsStatus       = useHardwareStore(s => s.setObsStatus);
+  const setOscStatus       = useHardwareStore(s => s.setOscStatus);
+  const setProPresenterStatus = useHardwareStore(s => s.setProPresenterStatus);
+  const setCompanionStatus = useHardwareStore(s => s.setCompanionStatus);
+  const setEasyWorshipStatus = useHardwareStore(s => s.setEasyWorshipStatus);
+  const setHealthItems     = useHardwareStore(s => s.setHealthItems);
+  const setProductionReadiness = useHardwareStore(s => s.setProductionReadiness);
+  const setIntegrationEvents = useHardwareStore(s => s.setIntegrationEvents);
+  const setIntegrations    = useHardwareStore(s => s.setIntegrations);
+  const setOperatorNameAction = useHardwareStore(s => s.setOperatorName);
+
   const translation = useTranslationStore();
 
   // Apply theme mode (light/dark/system) to document root. When the operator
@@ -194,10 +258,10 @@ export default function App() {
   // a fresh AI-detection result arrives (no-op if the operator left the
   // "auto-route" toggle off).
   useEffect(() => {
-    const codes = desktop.aiDetection?.languages?.map((l) => l.code) ?? [];
+    const codes = aiDetection?.languages?.map((l) => l.code) ?? [];
     if (codes.length === 0) return;
     translation.applyDetectedLanguages(codes);
-  }, [desktop.aiDetection?.checkedAtMs, translation]);
+  }, [aiDetection?.checkedAtMs, translation]);
 
   // Hydrate UI stores from the Rust KV once on boot. Order:
   //   1. Migrate any existing localStorage values up to Rust (one-time).
@@ -227,12 +291,15 @@ export default function App() {
   
   // Attach realtime backend listeners
   useTauriEvents(setCommandNotice);
+  // Background polling (AI analysis, transcript sync, vMix reconnect)
+  usePollingLoop(setCommandNotice);
 
   // Trusted plugins state
   const [trustedPlugins, setTrustedPlugins] = useState<TrustedPlugin[]>([]);
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const [selectedAudioDevice, setSelectedAudioDevice] = useState<string | undefined>(undefined);
   const [captureRunning, setCaptureRunning] = useState(false);
+  const [sttStatus, setSttStatus] = useState<import("./services/desktopApi").SttStatus | null>(null);
   const [onDemandVerse, setOnDemandVerse] = useState<Record<string, { text: string; source: string }>>({});
   const [fetchingVerse, setFetchingVerse] = useState<string | null>(null);
 
@@ -246,15 +313,15 @@ export default function App() {
     getDesktopServiceState()
       .then((state) => {
         if (cancelled) return;
-        desktop.setCandidates(state.candidates);
-        desktop.setTranscript(state.transcript);
-        hw.setIntegrations(state.integrations);
-        hw.setHealthItems(state.health);
-        desktop.setPreviewCandidate(state.preview);
-        desktop.setLiveCandidate(state.live);
-        desktop.setSelectedCandidate(state.preview);
-        desktop.setDestinationsArmed(state.session.destinationsArmed);
-        desktop.setDesktopStatus(state.session);
+        setCandidates(state.candidates);
+        setTranscript(state.transcript);
+        setIntegrations(state.integrations);
+        setHealthItems(state.health);
+        setPreviewCandidate(state.preview);
+        setLiveCandidate(state.live);
+        setSelectedCandidateAction(state.preview);
+        setDestinationsArmedAction(state.session.destinationsArmed);
+        setDesktopStatusAction(state.session);
         setCommandNotice(
           state.session.mode === "tauri"
             ? "Desktop core online. Local SQLite, audit, and command policy are active."
@@ -268,7 +335,7 @@ export default function App() {
 
     getVmixConfig().then((config) => {
       if (!cancelled) {
-        hw.setVmixStatus({ 
+        setVmixStatus({ 
           state: "offline", 
           checkedAtMs: Date.now(), 
           detail: "", 
@@ -279,49 +346,49 @@ export default function App() {
     });
 
     getVmixStatus().then((status) => {
-      if (!cancelled) hw.setVmixStatus(status);
+      if (!cancelled) setVmixStatus(status);
     });
 
     getRecentIntegrationEvents().then((events) => {
-      if (!cancelled) hw.setIntegrationEvents(events);
+      if (!cancelled) setIntegrationEvents(events);
     });
 
     getProductionReadiness().then((report) => {
-      if (!cancelled) hw.setProductionReadiness(report);
+      if (!cancelled) setProductionReadiness(report);
     });
 
     analyzeTranscript().then((result) => {
       if (cancelled) return;
-      desktop.setAiDetection(result);
-      desktop.mergeCandidates(result.candidates);
+      setAiDetection(result);
+      mergeCandidates(result.candidates);
       if (result.candidates[0]) {
-        desktop.setSelectedCandidate(result.candidates[0]);
-        desktop.setPreviewCandidate({ ...result.candidates[0], status: "preview" });
+        setSelectedCandidateAction(result.candidates[0]);
+        setPreviewCandidate({ ...result.candidates[0], status: "preview" });
       }
     });
 
     getObsStatus().then((status) => {
-      if (!cancelled) hw.setObsStatus(status);
+      if (!cancelled) setObsStatus(status);
     });
 
     getOscStatus().then((status) => {
-      if (!cancelled) hw.setOscStatus(status);
+      if (!cancelled) setOscStatus(status);
     });
 
     getEasyWorshipStatus().then((status) => {
-      if (!cancelled) hw.setEasyWorshipStatus(status);
+      if (!cancelled) setEasyWorshipStatus(status);
     });
 
     getProPresenterStatus().then((status) => {
-      if (!cancelled) hw.setProPresenterStatus(status);
+      if (!cancelled) setProPresenterStatus(status);
     });
 
     getCompanionStatus().then((status) => {
-      if (!cancelled) hw.setCompanionStatus(status);
+      if (!cancelled) setCompanionStatus(status);
     });
 
     getOperatorName().then((name) => {
-      if (!cancelled) hw.setOperatorName(name);
+      if (!cancelled) setOperatorNameAction(name);
     });
 
     listTrustedPlugins().then((plugins) => {
@@ -332,17 +399,27 @@ export default function App() {
       if (!cancelled) setAudioDevices(devices);
     });
 
+    getSttStatus().then((s) => {
+      if (!cancelled) setSttStatus(s);
+    }).catch(() => undefined);
+
+    // Pre-warm the SQLite FTS5 scripture index so the first real query
+    // returns instantly rather than paying the cold-start penalty.
+    searchScripture("John").catch(() => undefined);
+
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // Start audio capture immediately on mount — independent of which screen is
+  // active.  The operator must be able to navigate to Output, Integrations, or
+  // any other screen without the microphone stopping.  Re-runs only when the
+  // selected audio device changes (operator picks a different input).
   const captureStartedRef = useRef(false);
   useEffect(() => {
-    if (activeScreen !== "transcript" || captureStartedRef.current) return;
+    if (captureStartedRef.current) return;
     captureStartedRef.current = true;
-    // Pass undefined so Whisper auto-detects language; a future service profile
-    // picker can supply an explicit hint via a state variable here.
     void startAudioCapture(undefined, selectedAudioDevice)
       .then((modelPath) => {
         setCaptureRunning(true);
@@ -353,7 +430,8 @@ export default function App() {
         setCaptureRunning(false);
         setCommandNotice(error instanceof Error ? error.message : "Could not start live capture.");
       });
-  }, [activeScreen]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAudioDevice]); // activeScreen intentionally removed
 
   useEffect(() => {
     return () => {
@@ -364,38 +442,20 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    let vmixWasConnected = false;
-    const interval = window.setInterval(() => {
-      void analyzeTranscript()
-        .then((result) => {
-          desktop.setAiDetection(result);
-          desktop.mergeCandidates(result.candidates);
-        })
-        .catch(() => undefined);
-      void getDesktopServiceState()
-        .then((state) => {
-          desktop.setTranscript(state.transcript);
-        })
-        .catch(() => undefined);
+  // Stable noop refs — populated after handlers are defined below.
+  const clearLiveRef    = useRef<() => void>(() => undefined);
+  const panicClearRef   = useRef<() => void>(() => undefined);
 
-      // vMix auto-reconnect: if vMix was connected but is now offline,
-      // silently re-check every 30 s so mid-service crashes self-heal.
-      const isConnected = hw.vmixStatus?.state === "connected" || hw.vmixStatus?.state === "ready";
-      if (vmixWasConnected && !isConnected) {
-        void getVmixStatus()
-          .then((status) => {
-            hw.setVmixStatus(status);
-            if (status.state === "connected" || status.state === "ready") {
-              setCommandNotice("vMix reconnected automatically.");
-            }
-          })
-          .catch(() => undefined);
-      }
-      vmixWasConnected = isConnected;
-    }, 8000);
-    return () => window.clearInterval(interval);
-  }, []);
+  // Keyboard shortcuts (Ctrl+K, Ctrl+L w/ double-press guard, Alt+→, F12/Esc×3 panic)
+  useKeyboardShortcuts({
+    activeScreen,
+    previewCandidate: previewCandidate ?? null,
+    destinationsArmed: destinationsArmed,
+    onNavigate: setActiveScreen,
+    onSendLive: (candidate) => sendLive(candidate),
+    onClearLive: () => clearLiveRef.current(),
+    onPanicClear: () => panicClearRef.current(),
+  });
 
   const deferredSearchQuery = useDeferredValue(searchQuery);
 
@@ -416,6 +476,8 @@ export default function App() {
   };
 
   useEffect(() => {
+    // Min-length guard: avoid FTS queries on single characters
+    if (deferredSearchQuery.trim().length < 2) return;
     let cancelled = false;
     searchScripture(deferredSearchQuery).then((results) => {
       if (!cancelled) setSearchResults(results);
@@ -426,77 +488,43 @@ export default function App() {
     };
   }, [deferredSearchQuery]);
 
-  const lastEscRef = useRef<number>(0);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      // Guard: do not intercept keyboard commands if the operator is typing in a search box or text field
-      const activeTag = document.activeElement?.tagName;
-      if (activeTag === "INPUT" || activeTag === "TEXTAREA") {
-        if (event.key === "Escape") {
-          (document.activeElement as HTMLElement).blur();
-        }
-        return;
-      }
-
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setActiveScreen("search");
-      }
-
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
-        event.preventDefault();
-        if (desktop.previewCandidate) sendLive(desktop.previewCandidate);
-      }
-
-      if (event.altKey && event.key === "ArrowRight") {
-        event.preventDefault();
-        setActiveScreen(screenOrder[(currentIndex + 1) % screenOrder.length]);
-      }
-
-      if (event.key === "Escape") {
-        const now = Date.now();
-        if (now - lastEscRef.current < 600) {
-          clearLive();
-          lastEscRef.current = 0;
-        } else {
-          lastEscRef.current = now;
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentIndex, desktop.destinationsArmed, desktop.previewCandidate]);
 
   const preview = (candidate: ScriptureCandidate) => {
     const nextPreview: ScriptureCandidate = { ...candidate, status: "preview" };
-    desktop.setSelectedCandidate(candidate);
-    desktop.setPreviewCandidate(nextPreview);
+    setSelectedCandidateAction(candidate);
+    setPreviewCandidate(nextPreview);
     setCommandNotice(`Preview prepared for ${candidate.reference}.`);
 
     void renderPreviewScene(nextPreview).catch((error: unknown) => {
       setCommandNotice(error instanceof Error ? error.message : "Preview render failed.");
     });
+    // Persist the verdict against the live candidate row when this came from
+    // the live STT pipeline (id pattern "<segment>#<reference>").
+    if (candidate.id.includes("#")) {
+      void previewCandidateCmd(candidate.id).catch(() => undefined);
+    }
   };
 
-  const sendLive = (candidate = desktop.previewCandidate) => {
+  const sendLive = (candidate = previewCandidate) => {
     if (!candidate) return;
-    if (!desktop.destinationsArmed) {
+    if (!destinationsArmed) {
       setCommandNotice("Live output blocked. Arm destinations before sending.");
       return;
     }
 
-    void sendLiveCandidate(candidate, desktop.destinationsArmed)
+    if (candidate.id.includes("#")) {
+      void takeCandidateLiveCmd(candidate.id).catch(() => undefined);
+    }
+    void sendLiveCandidate(candidate, destinationsArmed)
       .then((result) => {
         const previewState: ScriptureCandidate = { ...candidate, status: "preview" };
         const liveState: ScriptureCandidate = { ...candidate, status: "live" };
-        desktop.setSelectedCandidate(liveState);
-        desktop.setPreviewCandidate(previewState);
-        desktop.setLiveCandidate(liveState);
+        setSelectedCandidateAction(liveState);
+        setPreviewCandidate(previewState);
+        setLiveCandidate(liveState);
         setActiveScreen("output");
-        if (desktop.desktopStatus) {
-           desktop.setDesktopStatus({...desktop.desktopStatus, auditCount: result.auditCount, lastEventSequence: result.auditCount, checkedAtMs: Date.now()});
+        if (desktopStatus) {
+           setDesktopStatusAction({...desktopStatus, auditCount: result.auditCount, lastEventSequence: result.auditCount, checkedAtMs: Date.now()});
         }
         setCommandNotice(`Live output sent: ${result.scene.reference} ${result.scene.translation}.`);
       })
@@ -506,12 +534,12 @@ export default function App() {
   };
 
   const toggleArmed = () => {
-    const next = !desktop.destinationsArmed;
-    desktop.setDestinationsArmed(next);
+    const next = !destinationsArmed;
+    setDestinationsArmedAction(next);
     setCommandNotice(next ? "Destinations armed for explicit live output." : "Safe hold enabled. Live output is blocked.");
 
     void setDestinationsArmed(next)
-      .then((status) => desktop.setDesktopStatus(status))
+      .then((status) => setDesktopStatusAction(status))
       .catch((error: unknown) => {
         setCommandNotice(error instanceof Error ? error.message : "Could not update destination arming.");
       });
@@ -520,13 +548,13 @@ export default function App() {
   const runHealthCheck = () => {
     void runPreServiceCheck()
       .then((items) => {
-        hw.setHealthItems(items);
-        if (desktop.desktopStatus) desktop.setDesktopStatus({ ...desktop.desktopStatus, checkedAtMs: Date.now() });
+        setHealthItems(items);
+        if (desktopStatus) setDesktopStatusAction({ ...desktopStatus, checkedAtMs: Date.now() });
         setCommandNotice("Pre-service check completed against the local core.");
         return getProductionReadiness();
       })
       .then((report) => {
-        hw.setProductionReadiness(report);
+        setProductionReadiness(report);
       })
       .catch((error: unknown) => {
         setCommandNotice(error instanceof Error ? error.message : "Pre-service check failed.");
@@ -536,11 +564,11 @@ export default function App() {
   const runAiAssist = () => {
     void analyzeTranscript()
       .then((result) => {
-        desktop.setAiDetection(result);
-        desktop.mergeCandidates(result.candidates);
+        setAiDetection(result);
+        mergeCandidates(result.candidates);
         if (result.candidates[0]) {
-          desktop.setSelectedCandidate(result.candidates[0]);
-          desktop.setPreviewCandidate({ ...result.candidates[0], status: "preview" });
+          setSelectedCandidateAction(result.candidates[0]);
+          setPreviewCandidate({ ...result.candidates[0], status: "preview" });
         }
         setCommandNotice(
           result.candidates[0]
@@ -560,7 +588,7 @@ export default function App() {
         setCommandNotice(bundle.path);
         return getProductionReadiness();
       })
-      .then(hw.setProductionReadiness)
+      .then(setProductionReadiness)
       .catch((error: unknown) => {
         setCommandNotice(error instanceof Error ? error.message : "Support bundle export failed.");
       });
@@ -606,7 +634,7 @@ export default function App() {
     setCommandNotice(`Installing offline asset ${assetId}...`);
     void installOfflineAsset(assetId)
       .then((report) => {
-        hw.setProductionReadiness(report);
+        setProductionReadiness(report);
         setCommandNotice(`Offline asset ${assetId} installed and verified.`);
       })
       .catch((error: unknown) => {
@@ -622,7 +650,7 @@ export default function App() {
     setCommandNotice(`Verifying ${assetId}...`);
     void installOfflineAssetFromPath(assetId, filePath, expectedChecksum)
       .then((report) => {
-        hw.setProductionReadiness(report);
+        setProductionReadiness(report);
         setCommandNotice(`Offline asset ${assetId} installed from ${filePath}.`);
       })
       .catch((error: unknown) => {
@@ -640,7 +668,7 @@ export default function App() {
     setCommandNotice(`Recording ${deviceId} - ${stepLabel}...`);
     void recordDeviceAcceptance(deviceId, stepLabel, passed, note, evidencePath)
       .then((report) => {
-        hw.setProductionReadiness(report);
+        setProductionReadiness(report);
         setCommandNotice(`Recorded ${deviceId} / ${stepLabel}: ${passed ? "pass" : "fail"}.`);
       })
       .catch((error: unknown) => {
@@ -649,13 +677,13 @@ export default function App() {
   };
 
   const refreshIntegrationEvents = () => {
-    void getRecentIntegrationEvents().then(hw.setIntegrationEvents);
+    void getRecentIntegrationEvents().then(setIntegrationEvents);
   };
 
   const saveVmixConfig = (config: VmixConfig) => {
     void updateVmixConfig(config)
       .then((status) => {
-        hw.setVmixStatus(status);
+        setVmixStatus(status);
         setCommandNotice(status.detail);
         refreshIntegrationEvents();
       })
@@ -690,25 +718,26 @@ export default function App() {
   };
 
   const clearLive = () => {
-    if (!desktop.liveCandidate) return;
-    const cleared: ScriptureCandidate = { ...desktop.liveCandidate, status: "new", text: "", reference: "—", reason: "Live output cleared by operator." };
-    desktop.setLiveCandidate(cleared);
+    if (!liveCandidate) return;
+    const cleared: ScriptureCandidate = { ...liveCandidate, status: "new", text: "", reference: "—", reason: "Live output cleared by operator." };
+    setLiveCandidate(cleared);
     setCommandNotice("Live output cleared.");
   };
+  clearLiveRef.current = clearLive;
 
   const blackout = () => {
-    if (!desktop.liveCandidate) return;
-    const black: ScriptureCandidate = { ...desktop.liveCandidate, status: "new", text: "", reference: "—", reason: "Safety blackout applied by operator." };
-    desktop.setLiveCandidate(black);
-    desktop.setPreviewCandidate(desktop.previewCandidate ? { ...desktop.previewCandidate, status: "new" } : null);
+    if (!liveCandidate) return;
+    const black: ScriptureCandidate = { ...liveCandidate, status: "new", text: "", reference: "—", reason: "Safety blackout applied by operator." };
+    setLiveCandidate(black);
+    setPreviewCandidate(previewCandidate ? { ...previewCandidate, status: "new" } : null);
     setCommandNotice("Safety blackout applied. Both preview and live are cleared.");
   };
 
   const stageDisplay = () => {
-    if (!desktop.previewCandidate) return;
-    const mirrored: ScriptureCandidate = { ...desktop.previewCandidate, status: "live" };
-    desktop.setLiveCandidate(mirrored);
-    setCommandNotice(`Stage display: mirrored preview (${desktop.previewCandidate.reference}) to live.`);
+    if (!previewCandidate) return;
+    const mirrored: ScriptureCandidate = { ...previewCandidate, status: "live" };
+    setLiveCandidate(mirrored);
+    setCommandNotice(`Stage display: mirrored preview (${previewCandidate.reference}) to live.`);
   };
 
   // NDI lower-third is not yet available — button is disabled in PreviewLiveOutput.
@@ -718,7 +747,7 @@ export default function App() {
     candidate: ScriptureCandidate,
     outcome: "confirmed" | "corrected" | "rejected"
   ) => {
-    const transcriptText = desktop.transcript.map((s) => s.text).join(" ").slice(0, 4000);
+    const transcriptText = transcript.map((s) => s.text).join(" ").slice(0, 4000);
     void recordCalibrationSample(
       candidate.language ?? "en",
       transcriptText,
@@ -733,9 +762,57 @@ export default function App() {
   };
 
   const rejectCandidate = (candidate: ScriptureCandidate) => {
-    desktop.removeCandidate(candidate.id);
+    removeCandidate(candidate.id);
     setCommandNotice(`Rejected ${candidate.reference}. Removed from queue.`);
+    if (candidate.id.includes("#")) {
+      void rejectCandidateCmd(candidate.id).catch(() => undefined);
+    }
   };
+
+  const panicClearOutputs = () => {
+    void clearAllOutputsCmd("operator-ui")
+      .then((targets) => {
+        setLiveCandidate(null);
+        setDestinationsArmedAction(false);
+        setCommandNotice(
+          targets.length > 0
+            ? `Panic clear: cleared ${targets.join(", ")}.`
+            : "Panic clear sent (no outputs reported).",
+        );
+      })
+      .catch((error: unknown) => {
+        setCommandNotice(error instanceof Error ? error.message : "Panic clear failed.");
+      });
+  };
+  // Assign the stable ref so the pre-declared keyboard shortcut hook can call it.
+  panicClearRef.current = panicClearOutputs;
+
+  const approveCandidate = (candidate: ScriptureCandidate) => {
+    const next: ScriptureCandidate = { ...candidate, status: "approved" };
+    setSelectedCandidateAction(next);
+    setCommandNotice(`Approved ${candidate.reference}.`);
+    if (candidate.id.includes("#")) {
+      void approveCandidateCmd(candidate.id).catch(() => undefined);
+    }
+  };
+
+  // Global panic-clear hotkey: Ctrl+Shift+. — chosen to avoid OS clashes and
+  // be reachable one-handed in a panic. Always-on while the app is focused.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === "." || e.code === "Period")) {
+        e.preventDefault();
+        panicClearOutputs();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Also expose via window for tests/DevTools.
+  if (typeof window !== "undefined") {
+    (window as unknown as { aletheiaPanicClear?: () => void }).aletheiaPanicClear = panicClearOutputs;
+  }
 
   const selectTranscriptSegment = (segment: TranscriptSegment) => {
     setSearchQuery(segment.text.slice(0, 60));
@@ -743,11 +820,10 @@ export default function App() {
     setCommandNotice(`Seeded search from transcript: "${segment.text.slice(0, 40)}…"`);
   };
 
-  // VMIX Handlers
   const checkVmix = () => {
     void getVmixStatus()
       .then((status) => {
-        hw.setVmixStatus(status);
+        setVmixStatus(status);
         setCommandNotice(status.detail);
       })
       .catch((error: unknown) => {
@@ -756,10 +832,10 @@ export default function App() {
   };
 
   const sendPreviewToVmix = () => {
-    if (!desktop.previewCandidate) return;
-    void sendVmixPreview(desktop.previewCandidate)
+    if (!previewCandidate) return;
+    void sendVmixPreview(previewCandidate)
       .then((result) => {
-        hw.setVmixStatus({ ...hw.vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
+        setVmixStatus({ ...vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
         setCommandNotice(result.detail);
         refreshIntegrationEvents();
       })
@@ -769,11 +845,11 @@ export default function App() {
   };
 
   const sendLiveToVmix = () => {
-    if (!desktop.previewCandidate) return;
-    void sendVmixLive(desktop.previewCandidate, desktop.destinationsArmed)
+    if (!previewCandidate) return;
+    void sendVmixLive(previewCandidate, destinationsArmed)
       .then((result) => {
-        desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" });
-        hw.setVmixStatus({ ...hw.vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
+        setLiveCandidate({ ...previewCandidate!, status: "live" });
+        setVmixStatus({ ...vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
         setCommandNotice(result.detail);
         refreshIntegrationEvents();
       })
@@ -785,7 +861,7 @@ export default function App() {
   const clearVmix = () => {
     void clearVmixOverlay()
       .then((result) => {
-        hw.setVmixStatus({ ...hw.vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
+        setVmixStatus({ ...vmixStatus!, state: result.state, detail: result.detail, checkedAtMs: Date.now() });
         setCommandNotice(result.detail);
         refreshIntegrationEvents();
       })
@@ -797,81 +873,81 @@ export default function App() {
   // OBS handlers
   const saveObsConfig = (config: ObsConfig) => {
     void updateObsConfig(config)
-      .then((result) => { hw.setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+      .then((result) => { setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OBS configuration save failed."));
   };
   const checkObs = () => {
-    void getObsStatus().then((result) => { hw.setObsStatus(result); setCommandNotice(result.detail); })
+    void getObsStatus().then((result) => { setObsStatus(result); setCommandNotice(result.detail); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OBS status check failed."));
   };
   const sendPreviewToObs = () => {
-    if (!desktop.previewCandidate) return;
-    void sendObsPreview(desktop.previewCandidate).then((result) => { hw.setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendObsPreview(previewCandidate).then((result) => { setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OBS preview failed."));
   };
   const sendLiveToObs = () => {
-    if (!desktop.previewCandidate) return;
-    void sendObsLive(desktop.previewCandidate, desktop.destinationsArmed).then((result) => { hw.setObsStatus(result); desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendObsLive(previewCandidate, destinationsArmed).then((result) => { setObsStatus(result); setLiveCandidate({ ...previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OBS live output failed."));
   };
   const clearObs = () => {
-    void clearObsOutput().then((result) => { hw.setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void clearObsOutput().then((result) => { setObsStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OBS clear failed."));
   };
 
   // ProPresenter handlers
   const saveProPresenterConfig = (config: ProPresenterConfig) => {
     void updateProPresenterConfig(config)
-      .then((result) => { hw.setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+      .then((result) => { setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "ProPresenter configuration save failed."));
   };
   const checkProPresenter = () => {
-    void getProPresenterStatus().then((result) => { hw.setProPresenterStatus(result); setCommandNotice(result.detail); })
+    void getProPresenterStatus().then((result) => { setProPresenterStatus(result); setCommandNotice(result.detail); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "ProPresenter status check failed."));
   };
   const sendPreviewToProPresenter = () => {
-    if (!desktop.previewCandidate) return;
-    void sendProPresenterPreview(desktop.previewCandidate).then((result) => { hw.setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendProPresenterPreview(previewCandidate).then((result) => { setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "ProPresenter preview failed."));
   };
   const sendLiveToProPresenter = () => {
-    if (!desktop.previewCandidate) return;
-    void sendProPresenterLive(desktop.previewCandidate, desktop.destinationsArmed).then((result) => { hw.setProPresenterStatus(result); desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendProPresenterLive(previewCandidate, destinationsArmed).then((result) => { setProPresenterStatus(result); setLiveCandidate({ ...previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "ProPresenter live output failed."));
   };
   const clearProPresenter = () => {
-    void clearProPresenterOutput().then((result) => { hw.setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void clearProPresenterOutput().then((result) => { setProPresenterStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "ProPresenter clear failed."));
   };
 
   // Companion handlers
   const saveCompanionConfig = (config: CompanionConfig) => {
-    void updateCompanionConfig(config).then((result) => { hw.setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void updateCompanionConfig(config).then((result) => { setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Companion configuration save failed."));
   };
   const checkCompanion = () => {
-    void getCompanionStatus().then((result) => { hw.setCompanionStatus(result); setCommandNotice(result.detail); })
+    void getCompanionStatus().then((result) => { setCompanionStatus(result); setCommandNotice(result.detail); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Companion status check failed."));
   };
   const sendPreviewToCompanion = () => {
-    if (!desktop.previewCandidate) return;
-    void sendCompanionPreview(desktop.previewCandidate).then((result) => { hw.setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendCompanionPreview(previewCandidate).then((result) => { setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Companion preview failed."));
   };
   const sendLiveToCompanion = () => {
-    if (!desktop.previewCandidate) return;
-    void sendCompanionLive(desktop.previewCandidate, desktop.destinationsArmed).then((result) => { hw.setCompanionStatus(result); desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendCompanionLive(previewCandidate, destinationsArmed).then((result) => { setCompanionStatus(result); setLiveCandidate({ ...previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Companion live output failed."));
   };
   const clearCompanion = () => {
-    void clearCompanionOutput().then((result) => { hw.setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void clearCompanionOutput().then((result) => { setCompanionStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Companion clear failed."));
   };
 
   // Operator identity
   const saveOperator = (name: string) => {
     void setOperatorName(name)
-      .then(() => { hw.setOperatorName(name); setCommandNotice(`Operator name saved: ${name}`); })
+      .then(() => { setOperatorNameAction(name); setCommandNotice(`Operator name saved: ${name}`); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "Could not save operator name."));
   };
 
@@ -887,53 +963,53 @@ export default function App() {
 
   // OSC handlers
   const saveOscConfig = (config: OscConfig) => {
-    void updateOscConfig(config).then((result) => { hw.setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void updateOscConfig(config).then((result) => { setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC configuration save failed."));
   };
   const checkOsc = () => {
-    void getOscStatus().then((result) => { hw.setOscStatus(result); setCommandNotice(result.detail); })
+    void getOscStatus().then((result) => { setOscStatus(result); setCommandNotice(result.detail); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC status check failed."));
   };
   const sendPreviewToOsc = () => {
-    if (!desktop.previewCandidate) return;
-    void sendOscPreview(desktop.previewCandidate).then((result) => { hw.setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendOscPreview(previewCandidate).then((result) => { setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC preview failed."));
   };
   const sendLiveToOsc = () => {
-    if (!desktop.previewCandidate) return;
-    void sendOscLive(desktop.previewCandidate, desktop.destinationsArmed).then((result) => { hw.setOscStatus(result); desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendOscLive(previewCandidate, destinationsArmed).then((result) => { setOscStatus(result); setLiveCandidate({ ...previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC live output failed."));
   };
   const clearOsc = () => {
-    void clearOscOutput().then((result) => { hw.setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void clearOscOutput().then((result) => { setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC clear failed."));
   };
   const sendOscPing = () => {
-    void sendOscTestPing().then((result) => { hw.setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void sendOscTestPing().then((result) => { setOscStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "OSC ping failed."));
   };
 
   // EasyWorship handlers
   const saveEasyWorshipConfig = (config: EasyWorshipConfig) => {
-    void updateEasyWorshipConfig(config).then((result) => { hw.setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void updateEasyWorshipConfig(config).then((result) => { setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "EasyWorship configuration save failed."));
   };
   const checkEasyWorship = () => {
-    void getEasyWorshipStatus().then((result) => { hw.setEasyWorshipStatus(result); setCommandNotice(result.detail); })
+    void getEasyWorshipStatus().then((result) => { setEasyWorshipStatus(result); setCommandNotice(result.detail); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "EasyWorship status check failed."));
   };
   const sendPreviewToEasyWorship = () => {
-    if (!desktop.previewCandidate) return;
-    void sendEasyWorshipPreview(desktop.previewCandidate).then((result) => { hw.setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendEasyWorshipPreview(previewCandidate).then((result) => { setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "EasyWorship preview failed."));
   };
   const sendLiveToEasyWorship = () => {
-    if (!desktop.previewCandidate) return;
-    void sendEasyWorshipLive(desktop.previewCandidate, desktop.destinationsArmed).then((result) => { hw.setEasyWorshipStatus(result); desktop.setLiveCandidate({ ...desktop.previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    if (!previewCandidate) return;
+    void sendEasyWorshipLive(previewCandidate, destinationsArmed).then((result) => { setEasyWorshipStatus(result); setLiveCandidate({ ...previewCandidate!, status: "live" }); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "EasyWorship live output failed."));
   };
   const clearEasyWorship = () => {
-    void clearEasyWorshipOutput().then((result) => { hw.setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
+    void clearEasyWorshipOutput().then((result) => { setEasyWorshipStatus(result); setCommandNotice(result.detail); refreshIntegrationEvents(); })
       .catch((error: unknown) => setCommandNotice(error instanceof Error ? error.message : "EasyWorship clear failed."));
   };
 
@@ -942,30 +1018,114 @@ export default function App() {
   }
 
   return (
+    <ErrorBoundary
+      fallback={
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                      height: "100vh", gap: 16, color: "#f87171", background: "#0d0d14", fontFamily: "sans-serif" }}>
+          <span style={{ fontSize: 48 }}>&#x26A0;&#xFE0F;</span>
+          <strong style={{ fontSize: 20 }}>Aletheia encountered an error</strong>
+          <p style={{ color: "#94a3b8", maxWidth: 360, textAlign: "center" }}>
+            An unexpected error occurred in the interface. Your session data is safe.
+          </p>
+          <button
+            onClick={() => window.location.reload()}
+            style={{ padding: "10px 24px", borderRadius: 8, background: "#4f46e5",
+                     color: "#fff", border: "none", cursor: "pointer", fontSize: 14 }}
+          >
+            Reload Aletheia
+          </button>
+        </div>
+      }
+    >
+    <AudioStreamProvider active={captureRunning} deviceLabel={selectedAudioDevice}>
     <WorkspaceShell
       active={activeScreen}
       onNavigate={setActiveScreen}
       title={activeMeta.title}
-      preview={desktop.previewCandidate!}
-      live={desktop.liveCandidate!}
-      armed={desktop.destinationsArmed}
-      desktopStatus={desktop.desktopStatus || undefined}
+      preview={previewCandidate!}
+      live={liveCandidate!}
+      armed={destinationsArmed}
+      desktopStatus={desktopStatus || undefined}
       onToggleArmed={toggleArmed}
       onSendLive={() => sendLive()}
       onManualSearch={() => setActiveScreen("search")}
+      onPanicClear={panicClearOutputs}
+      captureActive={captureRunning}
     >
-      {activeScreen === "dashboard" && desktop.selectedCandidate ? (
-        <Suspense fallback={<LazyFallback />}>
-        <OperatorDashboard
-          candidate={desktop.selectedCandidate}
-          transcript={desktop.transcript}
-          integrations={hw.integrations}
-          aiDetection={desktop.aiDetection || undefined}
-          onPreview={() => preview(desktop.selectedCandidate!)}
-          onLive={() => sendLive(desktop.selectedCandidate!)}
-          onAnalyze={runAiAssist}
-        />
-        </Suspense>
+      {activeScreen === "dashboard" ? (
+        selectedCandidate ? (
+          <OperatorDashboard
+            candidate={selectedCandidate}
+            transcript={transcript}
+            integrations={integrations}
+            aiDetection={aiDetection || undefined}
+            onPreview={() => preview(selectedCandidate!)}
+            onLive={() => sendLive(selectedCandidate!)}
+            onAnalyze={runAiAssist}
+            sttStatus={sttStatus}
+            audioDevices={audioDevices}
+            selectedAudioDevice={selectedAudioDevice}
+            captureRunning={captureRunning}
+            captureNotice={commandNotice}
+            onSelectDevice={(d) => {
+              setSelectedAudioDevice(d);
+              // Force re-arm so the auto-start effect re-runs with the new device.
+              captureStartedRef.current = false;
+              setCaptureRunning(false);
+            }}
+            onStartCapture={() => {
+              captureStartedRef.current = false;
+              void startAudioCapture(undefined, selectedAudioDevice)
+                .then((modelPath) => {
+                  captureStartedRef.current = true;
+                  setCaptureRunning(true);
+                  setCommandNotice(`Live capture started (${modelPath.split(/[\\/]/).pop() ?? "model"}).`);
+                })
+                .catch((error: unknown) => {
+                  captureStartedRef.current = false;
+                  setCaptureRunning(false);
+                  setCommandNotice(error instanceof Error ? error.message : "Could not start live capture.");
+                });
+            }}
+            onStopCapture={() => {
+              void stopAudioCapture()
+                .then(() => {
+                  captureStartedRef.current = false;
+                  setCaptureRunning(false);
+                  setCommandNotice("Live capture stopped.");
+                })
+                .catch((error: unknown) => {
+                  setCommandNotice(error instanceof Error ? error.message : "Could not stop capture.");
+                });
+            }}
+            onReloadModel={() => {
+              void reloadSttModel()
+                .then((s) => {
+                  setSttStatus(s);
+                  setCommandNotice(
+                    s.modelLoaded
+                      ? `Model loaded: ${s.modelFilename ?? s.modelPath ?? "ok"}.`
+                      : (s.loadError ?? "Could not load model.")
+                  );
+                })
+                .catch((error: unknown) => {
+                  setCommandNotice(error instanceof Error ? error.message : "Reload failed.");
+                });
+            }}
+            onRefreshDevices={() => {
+              void listAudioDevices()
+                .then((devices) => {
+                  setAudioDevices(devices);
+                  setCommandNotice(`Detected ${devices.length} input device${devices.length === 1 ? "" : "s"}.`);
+                })
+                .catch((error: unknown) => {
+                  setCommandNotice(error instanceof Error ? error.message : "Device scan failed.");
+                });
+            }}
+          />
+        ) : (
+          <AwaitingDetection captureRunning={captureRunning} />
+        )
       ) : null}
       {activeScreen === "transcript" ? (
         <>
@@ -1001,44 +1161,59 @@ export default function App() {
             </div>
           )}
           <LiveTranscriptView
-            transcript={desktop.transcript}
-            candidates={desktop.candidates}
+            transcript={transcript}
+            candidates={candidates}
             onPreview={preview}
             onSelectSegment={selectTranscriptSegment}
           />
         </>
       ) : null}
-      {activeScreen === "queue" && desktop.selectedCandidate ? (
-        <QueueApprovalPanel
-          activeCandidate={desktop.selectedCandidate}
-          candidates={desktop.candidates}
-          onPreview={preview}
-          onLive={sendLive}
-          onReject={rejectCandidate}
-          onMerge={(candidate) => desktop.mergeCandidates([candidate])}
-          onCalibrate={calibrateCandidate}
-        />
+      {activeScreen === "queue" ? (
+        selectedCandidate ? (
+          <QueueApprovalPanel
+            activeCandidate={selectedCandidate}
+            candidates={candidates}
+            onPreview={preview}
+            onLive={sendLive}
+            onReject={rejectCandidate}
+            onApprove={approveCandidate}
+            onMerge={(candidate) => mergeCandidates([candidate])}
+            onCalibrate={calibrateCandidate}
+          />
+        ) : (
+          <AwaitingDetection captureRunning={captureRunning} />
+        )
       ) : null}
-      {activeScreen === "output" && desktop.previewCandidate && desktop.liveCandidate ? (
-        <PreviewLiveOutput
-          preview={desktop.previewCandidate}
-          live={desktop.liveCandidate}
-          armed={desktop.destinationsArmed}
-          integrations={hw.integrations}
-          onSendLive={() => sendLive()}
-          onToggleArmed={toggleArmed}
-          onClearLive={clearLive}
-          onBlackout={blackout}
-          onStageDisplay={stageDisplay}
-          onLowerThird={lowerThird}
-        />
+      {activeScreen === "output" ? (
+        previewCandidate ? (
+          <PreviewLiveOutput
+            preview={previewCandidate}
+            live={liveCandidate ?? {
+              ...previewCandidate,
+              status: "new" as const,
+              text: "",
+              reference: "—",
+              reason: "No live output yet."
+            }}
+            armed={destinationsArmed}
+            integrations={integrations}
+            onSendLive={() => sendLive()}
+            onToggleArmed={toggleArmed}
+            onClearLive={clearLive}
+            onBlackout={blackout}
+            onStageDisplay={stageDisplay}
+            onLowerThird={lowerThird}
+          />
+        ) : (
+          <AwaitingDetection captureRunning={captureRunning} />
+        )
       ) : null}
-      {activeScreen === "theme" && desktop.previewCandidate ? (
+      {activeScreen === "theme" && previewCandidate ? (
         <Suspense fallback={<LazyFallback />}>
         <ThemeDesigner
           selectedTheme={selectedTheme}
           onSelectTheme={setSelectedTheme}
-          preview={desktop.previewCandidate}
+          preview={previewCandidate}
           onPublish={(theme) => {
             // Persist active theme across sessions via localStorage
             if (typeof localStorage !== "undefined") {
@@ -1050,18 +1225,18 @@ export default function App() {
         />
         </Suspense>
       ) : null}
-      {activeScreen === "integrations" && hw.vmixStatus ? (
+      {activeScreen === "integrations" && vmixStatus ? (
         <Suspense fallback={<LazyFallback />}>
         <IntegrationsSettings
-          integrations={hw.integrations}
-          vmixStatus={hw.vmixStatus}
-          integrationEvents={hw.integrationEvents}
-          obsStatus={hw.obsStatus || undefined}
-          proPresenterStatus={hw.proPresenterStatus || undefined}
-          companionStatus={hw.companionStatus || undefined}
-          oscStatus={hw.oscStatus || undefined}
-          easyWorshipStatus={hw.easyWorshipStatus || undefined}
-          operatorName={hw.operatorName}
+          integrations={integrations}
+          vmixStatus={vmixStatus}
+          integrationEvents={integrationEvents}
+          obsStatus={obsStatus || undefined}
+          proPresenterStatus={proPresenterStatus || undefined}
+          companionStatus={companionStatus || undefined}
+          oscStatus={oscStatus || undefined}
+          easyWorshipStatus={easyWorshipStatus || undefined}
+          operatorName={operatorName}
           trustedPlugins={trustedPlugins}
           onSaveVmixConfig={saveVmixConfig}
           onCheckVmix={checkVmix}
@@ -1104,12 +1279,12 @@ export default function App() {
         />
         </Suspense>
       ) : null}
-      {activeScreen === "health" && hw.productionReadiness ? (
+      {activeScreen === "health" && productionReadiness ? (
         <Suspense fallback={<LazyFallback />}>
         <div className="space-y-7">
         <HealthStatusPanel
-          items={hw.healthItems}
-          readiness={hw.productionReadiness}
+          items={healthItems}
+          readiness={productionReadiness}
           supportBundleExport={supportBundleExport || undefined}
           rehearsalReport={rehearsalReport || undefined}
           offlinePackExport={offlinePackExport || undefined}
@@ -1122,7 +1297,27 @@ export default function App() {
           onRecordDeviceAcceptance={handleRecordDeviceAcceptance}
         />
         <HardwareChecklistPanel />
+        {/* ── #9 Model Download Wizard ─────────────────── */}
+        <Suspense fallback={null}>
+          <ModelDownloadWizard />
+        </Suspense>
         </div>
+        </Suspense>
+      ) : null}
+      {/* ── #3 Session Resume Banner ────────────────────────────────── */}
+      <SessionResumeBanner onResume={(info) => {
+        console.info("[aletheia] resuming session", info.sessionId);
+      }} />
+      {/* ── #7 Service Report ───────────────────────────────────────── */}
+      {activeScreen === "service-report" ? (
+        <Suspense fallback={<LazyFallback />}>
+          <ServiceReportPanel />
+        </Suspense>
+      ) : null}
+      {/* ── #5 Transcript History Search ────────────────────────────── */}
+      {activeScreen === "transcript-search" ? (
+        <Suspense fallback={<LazyFallback />}>
+          <TranscriptSearchPanel />
         </Suspense>
       ) : null}
       {activeScreen === "onboarding" ? (
@@ -1130,16 +1325,16 @@ export default function App() {
           <OnboardingFlow onContinue={() => setActiveScreen("health")} />
         </Suspense>
       ) : null}
-      {activeScreen === "stream" && desktop.liveCandidate ? (
+      {activeScreen === "stream" && liveCandidate ? (
         <Suspense fallback={<LazyFallback />}>
-          <StreamOverlayPanel live={desktop.liveCandidate} />
+          <StreamOverlayPanel live={liveCandidate} />
         </Suspense>
       ) : null}
       {activeScreen === "songs" ? (
         <Suspense fallback={<LazyFallback />}>
           <SongLibraryPanel
-            serviceSessionId={desktop.desktopStatus?.serviceSession ?? "browser-session"}
-            operator={hw.operatorName || "operator"}
+            serviceSessionId={desktopStatus?.serviceSession ?? "browser-session"}
+            operator={operatorName || "operator"}
             onSendSectionLive={(song, section) => {
               const synthetic: ScriptureCandidate = {
                 id: `song-${song.id}-${Date.now()}`,
@@ -1152,18 +1347,15 @@ export default function App() {
                 reason: "Song section sent live by operator.",
                 status: "live"
               };
-              // Route through the full live pipeline so OBS/ProPresenter/vMix/Companion/OSC/EasyWorship
-              // all receive the section, the audit chain records it, and the production rail updates.
-              desktop.setSelectedCandidate(synthetic);
-              desktop.setPreviewCandidate({ ...synthetic, status: "preview" });
+              setSelectedCandidateAction(synthetic);
+              setPreviewCandidate({ ...synthetic, status: "preview" });
               sendLive(synthetic);
-              // Also log the CCLI usage in the Rust audit chain (durable past localStorage).
               if (song.ccliNumber) {
                 void logCcliUsage(
                   song.ccliNumber,
                   song.title,
-                  desktop.desktopStatus?.serviceSession ?? "browser-session",
-                  hw.operatorName || "operator"
+                  desktopStatus?.serviceSession ?? "browser-session",
+                  operatorName || "operator"
                 ).catch(() => undefined);
               }
             }}
@@ -1172,18 +1364,24 @@ export default function App() {
       ) : null}
       {activeScreen === "fleet" ? (
         <Suspense fallback={<LazyFallback />}>
-          <FleetSyncPanel deviceLabel={desktop.desktopStatus?.serviceSession ?? "Browser device"} />
+          <FleetSyncPanel deviceLabel={desktopStatus?.serviceSession ?? "Browser device"} />
         </Suspense>
       ) : null}
-      {activeScreen === "clips" && desktop.liveCandidate ? (
+      {activeScreen === "clips" && liveCandidate ? (
         <Suspense fallback={<LazyFallback />}>
           <ClipEdlPanel
-            live={desktop.liveCandidate}
-            serviceStartedAtMs={desktop.desktopStatus?.checkedAtMs ?? Date.now()}
+            live={liveCandidate}
+            serviceStartedAtMs={desktopStatus?.checkedAtMs ?? Date.now()}
           />
         </Suspense>
       ) : null}
+      {activeScreen === "diagnostics" ? (
+        <Suspense fallback={<LazyFallback />}>
+          <DiagnosticsScreen />
+        </Suspense>
+      ) : null}
       {activeScreen === "search" ? (
+
         <Suspense fallback={<LazyFallback />}>
         <ManualSearchFallback
           query={searchQuery}
@@ -1196,6 +1394,8 @@ export default function App() {
       ) : null}
       <NoticeToast notice={commandNotice} />
     </WorkspaceShell>
+    </AudioStreamProvider>
+    </ErrorBoundary>
   );
 }
 
@@ -1205,6 +1405,54 @@ function LazyFallback() {
       <span className="inline-flex items-center gap-2">
         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-violet-400" />
         Loading screen…
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Shown on any screen that requires a detected scripture when none has arrived
+ * yet.  Communicates whether the microphone is armed so the operator knows the
+ * system is actually listening.
+ */
+function AwaitingDetection({ captureRunning }: { captureRunning: boolean }) {
+  return (
+    <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-4 text-center">
+      <span style={{ fontSize: 48 }}>🎙️</span>
+      <p style={{ color: "var(--text-primary, #e2e8f0)", fontSize: 18, fontWeight: 600, margin: 0 }}>
+        Listening for scripture…
+      </p>
+      <p style={{ color: "var(--text-muted, #94a3b8)", fontSize: 13, maxWidth: 340, margin: 0, lineHeight: 1.6 }}>
+        {captureRunning
+          ? "Microphone is armed and capturing. Scripture candidates will appear here automatically once a verse or biblical reference is spoken."
+          : "Microphone is not armed. Start audio capture from the Dashboard to begin live detection."}
+      </p>
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "6px 16px",
+          borderRadius: 999,
+          fontSize: 12,
+          fontWeight: 600,
+          letterSpacing: "0.05em",
+          background: captureRunning ? "rgba(52,211,153,0.12)" : "rgba(148,163,184,0.1)",
+          color: captureRunning ? "#34d399" : "#94a3b8",
+          border: `1px solid ${captureRunning ? "rgba(52,211,153,0.3)" : "rgba(148,163,184,0.2)"}`,
+        }}
+      >
+        <span
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: "50%",
+            background: captureRunning ? "#34d399" : "#64748b",
+            animation: captureRunning ? "pulse 1.5s ease-in-out infinite" : "none",
+            flexShrink: 0,
+          }}
+        />
+        {captureRunning ? "CAPTURING" : "NOT ARMED"}
       </span>
     </div>
   );

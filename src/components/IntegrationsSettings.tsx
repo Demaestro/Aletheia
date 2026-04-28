@@ -292,7 +292,7 @@ export function IntegrationsSettings({
         action={<ActionButton onClick={onCheckVmix}>Check vMix</ActionButton>}
       />
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
         {categories.map((category) => {
           const Icon = category.icon;
           return (
@@ -305,33 +305,46 @@ export function IntegrationsSettings({
         })}
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="rounded-[6px] border border-white/5 bg-white/5">
-          <div className="grid grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] border-b border-white/5 px-4 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-muted">
-            <span>Adapter</span>
-            <span>Transport</span>
-            <span>Capability</span>
+      {/* ── Adapter list + vMix config ── */}
+      <div className="grid gap-5 2xl:grid-cols-[1fr_440px]">
+
+        {/* Adapter cards */}
+        <div className="overflow-hidden rounded-[8px] border border-white/8 bg-white/[0.035]">
+
+          {/* Column header */}
+          <div className="grid grid-cols-[1fr_auto] border-b border-white/8 px-5 py-3 text-[11px] font-semibold uppercase tracking-widest text-muted">
+            <span>Adapter · Capability</span>
             <span>Status</span>
           </div>
-          <div className="divide-y divide-line">
+
+          {/* Rows */}
+          <div className="divide-y divide-white/[0.05]">
             {integrations.map((integration) => (
               <button
                 key={integration.id}
                 type="button"
-                className="group grid w-full grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] items-center px-4 py-4 text-left transition hover:bg-mist focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                className="group flex w-full items-start gap-4 px-5 py-4 text-left transition-colors hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
               >
-                <span className="flex items-center gap-3">
-                  <span className="grid h-9 w-9 place-items-center rounded-[6px] border border-white/5 bg-paper">
-                    <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
-                  </span>
-                  <span>
-                    <span className="block text-sm font-semibold text-ink">{integration.name}</span>
-                    <span className="mt-1 block text-xs text-muted">{integration.detail}</span>
-                  </span>
+                {/* Icon */}
+                <span className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-white/8 bg-paper">
+                  <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
                 </span>
-                <span className="text-sm text-graphite">{integration.kind}</span>
-                <span className="text-sm text-muted">{integration.capability}</span>
-                <span className="flex justify-end">
+
+                {/* Name + transport + capability */}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-ink">{integration.name}</span>
+                  <span className="mt-0.5 block text-xs text-muted">
+                    <span className="font-medium text-graphite">{integration.kind}</span>
+                    {" — "}
+                    {integration.capability}
+                  </span>
+                  {integration.detail && (
+                    <span className="mt-1 block text-xs text-muted/70">{integration.detail}</span>
+                  )}
+                </span>
+
+                {/* Status pill */}
+                <span className="mt-0.5 flex-none">
                   <StatusPill tone={statusTone(integration.state)} label={integration.state} />
                 </span>
               </button>
@@ -339,14 +352,14 @@ export function IntegrationsSettings({
           </div>
         </div>
 
-        <aside className="space-y-4">
-          <div className="rounded-[6px] border border-white/5 bg-white/5 p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">vMix bridge</p>
-                <h3 className="mt-2 text-xl font-semibold tracking-tight text-ink">Overlay scripture title</h3>
+        <aside className="min-w-0 space-y-4">
+          <div className="rounded-[8px] border border-white/8 bg-white/[0.035] p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-muted">vMix bridge</p>
+                <h3 className="mt-1 text-lg font-semibold tracking-tight text-ink">Overlay scripture title</h3>
               </div>
-              <StatusPill tone={vmixTone} label={vmixStatus.state} />
+              <span className="flex-none"><StatusPill tone={vmixTone} label={vmixStatus.state} /></span>
             </div>
 
             <p className="mt-4 text-sm leading-6 text-muted">{vmixStatus.detail}</p>
@@ -880,7 +893,7 @@ function TextField({ label, value, onChange }: { label: string; value: string; o
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );
@@ -896,7 +909,7 @@ function NumberField({ label, value, min, max, onChange }: { label: string; valu
         max={max}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );

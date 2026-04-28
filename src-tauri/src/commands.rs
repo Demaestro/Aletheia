@@ -24,7 +24,7 @@ use crate::dto::*;
 use crate::audit::*;
 use crate::{
     scene_from_candidate, output_health_to_state_detail, live_integrations,
-    production_transcript, production_candidates, detect_candidates_for_transcript,
+    production_transcript, detect_candidates_for_transcript,
     language_detections_from_transcript, supported_language_to_dto, accuracy_target_dto,
     merged_offline_asset_manifest, stt_readiness_from_manifest,
     offline_asset_root, sha256_file_hex, verified_manifest_to_dto, scene_to_dto,
@@ -46,12 +46,13 @@ pub fn get_service_state(state: State<'_, DesktopState>) -> Result<ServiceStateD
     let runtime = state.lock_runtime()?.clone();
     let audit_count = state.audit_count()?;
 
-    let live_segments = state.snapshot_live_transcript();
-    let transcript = if live_segments.is_empty() {
-        production_transcript()
-    } else {
-        live_segments
-    };
+    // Live transcript only — never inject `production_transcript()` here.
+    // The 1-second polling loop on the UI calls this command continuously,
+    // so any demo fallback floods the queue with fake candidates and masks
+    // real detections (architecture vision: "wrong scripture is worse than
+    // no scripture"). Empty list → operator sees "Listening for scripture…"
+    // until real audio arrives.
+    let transcript = state.snapshot_live_transcript();
 
     // Build a dynamic session ID based on today's date in UTC.
     let checked_at = now_ms();
@@ -94,7 +95,12 @@ pub fn get_service_state(state: State<'_, DesktopState>) -> Result<ServiceStateD
             checked_at_ms: checked_at,
         },
         transcript,
-        candidates: production_candidates(),
+        // Honest empty queue when the operator hasn't kicked off a session
+        // yet. The previous demo fallback meant the dashboard always showed
+        // "Romans 8:28 / Isaiah 40:31 / Psalm 23:1 / John 3:16" pre-populated
+        // even on a brand-new install — masking the fact that capture wasn't
+        // running and that the scripture library was still warming up.
+        candidates: Vec::new(),
         integrations: live_integrations(&state),
         health,
         preview: runtime.preview,
@@ -111,7 +117,9 @@ pub fn search_scripture(state: State<'_, DesktopState>, query: String) -> Result
 
     let store = state.lock_store()?;
 
-    // Try exact reference parse first.
+    // Try exact reference parse first. `verse_to_search_result` calls
+    // `clean_verse_text_for_display` internally so KJV translator-italics
+    // braces are stripped before the snippet hits the operator UI.
     if let Some((book, chapter, verse)) = parse_reference(trimmed) {
         if let Ok(Some(record)) = store.find_verse("kjv", &book, chapter, verse) {
             return Ok(vec![verse_to_search_result(record, "Exact reference")]);
@@ -232,12 +240,10 @@ pub fn run_pre_service_check(state: State<'_, DesktopState>) -> Result<Vec<Healt
 
 #[tauri::command]
 pub fn analyze_transcript(state: State<'_, DesktopState>) -> Result<AiDetectionResultDto, String> {
-    let live_segments = state.snapshot_live_transcript();
-    let transcript = if live_segments.is_empty() {
-        production_transcript()
-    } else {
-        live_segments
-    };
+    // Live transcript only — see comment in get_service_state. Returning an
+    // empty AI result for an empty transcript is correct; the polling loop
+    // calls this every second and any demo data here pre-pollutes the queue.
+    let transcript = state.snapshot_live_transcript();
     let runtime = state.lock_runtime()?.clone();
     let store = state.lock_store()?;
     let manifest = merged_offline_asset_manifest(&store)?;
@@ -257,7 +263,7 @@ pub fn analyze_transcript(state: State<'_, DesktopState>) -> Result<AiDetectionR
             if candidate.text == "Detected scripture candidate requires operator review." {
                 if let Some((book, chapter, verse)) = parse_reference(&candidate.reference) {
                     if let Ok(Some(record)) = store.find_verse("kjv", &book, chapter, verse) {
-                        candidate.text = record.text;
+                        candidate.text = crate::clean_verse_text_for_display(&record.text);
                     }
                 }
             }
@@ -1602,6 +1608,7 @@ pub fn start_audio_capture(language_hint: Option<String>, device_name: Option<St
                 text: trimmed.to_string(),
                 confidence: 88,
                 latency_ms,
+                ..Default::default()
             };
 
             if let Ok(mut q) = live_transcript.lock() {

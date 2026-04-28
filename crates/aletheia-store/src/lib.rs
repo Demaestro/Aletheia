@@ -4,7 +4,7 @@ use aletheia_core::{AuditAction, EventEnvelope, TimestampMs};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// SQLite-backed local store.
 pub struct AletheiaStore {
@@ -586,6 +586,264 @@ impl AletheiaStore {
         ).optional()?)
     }
 
+    // -----------------------------------------------------------------------
+    // Service sessions (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Creates or updates a service session row. Idempotent on `id`.
+    pub fn upsert_service_session(&self, session: &ServiceSessionRecord) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO service_sessions
+               (id, name, started_at_ms, ended_at_ms, data_miser_enabled, offline_mode_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               started_at_ms = excluded.started_at_ms,
+               ended_at_ms = excluded.ended_at_ms,
+               data_miser_enabled = excluded.data_miser_enabled,
+               offline_mode_enabled = excluded.offline_mode_enabled",
+            params![
+                session.id,
+                session.name,
+                session.started_at_ms,
+                session.ended_at_ms,
+                session.data_miser_enabled as i64,
+                session.offline_mode_enabled as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a session as ended.
+    pub fn end_service_session(&self, id: &str, ended_at_ms: TimestampMs) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE service_sessions SET ended_at_ms = ?1 WHERE id = ?2",
+            params![ended_at_ms, id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns a single service session by id.
+    pub fn get_service_session(&self, id: &str) -> StoreResult<Option<ServiceSessionRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, started_at_ms, ended_at_ms, data_miser_enabled, offline_mode_enabled
+                 FROM service_sessions WHERE id = ?1",
+                params![id],
+                ServiceSessionRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Transcript segments (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Inserts one transcript segment row.
+    pub fn insert_transcript_segment(
+        &self,
+        segment: &TranscriptSegmentRecord,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO transcript_segments
+               (id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                language, text, confidence, adapter, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               started_at_ms = excluded.started_at_ms,
+               ended_at_ms = excluded.ended_at_ms,
+               speaker_label = excluded.speaker_label,
+               language = excluded.language,
+               text = excluded.text,
+               confidence = excluded.confidence,
+               adapter = excluded.adapter,
+               latency_ms = excluded.latency_ms",
+            params![
+                segment.id,
+                segment.session_id,
+                segment.started_at_ms,
+                segment.ended_at_ms,
+                segment.speaker_label,
+                segment.language,
+                segment.text,
+                segment.confidence,
+                segment.adapter,
+                segment.latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recent transcript segments for a session, newest first.
+    pub fn recent_transcript_segments(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<TranscriptSegmentRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                    language, text, confidence, adapter, latency_ms
+             FROM transcript_segments
+             WHERE session_id = ?1
+             ORDER BY started_at_ms DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], TranscriptSegmentRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripture candidates (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Inserts one scripture candidate row.
+    pub fn insert_scripture_candidate(
+        &self,
+        candidate: &ScriptureCandidateRecord,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO scripture_candidates
+               (id, session_id, reference, translation_id, language, score,
+                bucket, status, reason, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               reference = excluded.reference,
+               translation_id = excluded.translation_id,
+               language = excluded.language,
+               score = excluded.score,
+               bucket = excluded.bucket,
+               status = excluded.status,
+               reason = excluded.reason",
+            params![
+                candidate.id,
+                candidate.session_id,
+                candidate.reference,
+                candidate.translation_id,
+                candidate.language,
+                candidate.score,
+                candidate.bucket,
+                candidate.status,
+                candidate.reason,
+                candidate.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Updates the status field of a candidate (e.g. `"pending"` →
+    /// `"approved"` | `"rejected"` | `"live"` | `"cleared"`).
+    pub fn update_scripture_candidate_status(
+        &self,
+        candidate_id: &str,
+        status: &str,
+    ) -> StoreResult<usize> {
+        Ok(self.connection.execute(
+            "UPDATE scripture_candidates SET status = ?1 WHERE id = ?2",
+            params![status, candidate_id],
+        )?)
+    }
+
+    /// Returns the most recent candidates for a session, newest first.
+    pub fn recent_scripture_candidates(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<ScriptureCandidateRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, reference, translation_id, language, score,
+                    bucket, status, reason, created_at_ms
+             FROM scripture_candidates
+             WHERE session_id = ?1
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], ScriptureCandidateRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator actions (v9)
+    // -----------------------------------------------------------------------
+
+    /// Records one operator verdict. Returns the new row id.
+    pub fn insert_operator_action(&self, action: &OperatorActionRecord) -> StoreResult<i64> {
+        self.connection.execute(
+            "INSERT INTO operator_actions
+               (session_id, candidate_id, action_type, actor, payload_json, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                action.session_id,
+                action.candidate_id,
+                action.action_type,
+                action.actor,
+                action.payload_json,
+                action.occurred_at_ms,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Lists the most recent operator actions for a session, newest first.
+    pub fn recent_operator_actions(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<OperatorActionRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, candidate_id, action_type, actor, payload_json, occurred_at_ms
+             FROM operator_actions
+             WHERE session_id = ?1
+             ORDER BY occurred_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], OperatorActionRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Display events (v9)
+    // -----------------------------------------------------------------------
+
+    /// Records a display event (preview, take-live, extend, or clear).
+    pub fn insert_display_event(&self, event: &DisplayEventRecord) -> StoreResult<i64> {
+        self.connection.execute(
+            "INSERT INTO display_events
+               (session_id, candidate_id, action, output_target, triggered_by,
+                locked_at_ms, released_at_ms, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.session_id,
+                event.candidate_id,
+                event.action,
+                event.output_target,
+                event.triggered_by,
+                event.locked_at_ms,
+                event.released_at_ms,
+                event.detail_json,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Lists the most recent display events for a session, newest first.
+    pub fn recent_display_events(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<DisplayEventRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, candidate_id, action, output_target,
+                    triggered_by, locked_at_ms, released_at_ms, detail_json
+             FROM display_events
+             WHERE session_id = ?1
+             ORDER BY locked_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], DisplayEventRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
     /// Gives advanced services controlled access to the connection.
     pub fn connection(&self) -> &Connection {
         &self.connection
@@ -629,6 +887,96 @@ impl AletheiaStore {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended session / audit helpers (v9+)
+    // -----------------------------------------------------------------------
+
+    /// Alias for `get_service_session` — preferred name in new command code.
+    pub fn find_service_session(&self, id: &str) -> StoreResult<Option<ServiceSessionRecord>> {
+        self.get_service_session(id)
+    }
+
+    /// Returns the number of transcript segments persisted for a session.
+    pub fn count_transcript_segments_for_session(&self, session_id: &str) -> StoreResult<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM transcript_segments WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Returns the number of scripture candidates recorded for a session.
+    pub fn count_scripture_candidates_for_session(&self, session_id: &str) -> StoreResult<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM scripture_candidates WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Returns ALL operator actions for a session in chronological order.
+    /// Used by the service report generator — no pagination needed here
+    /// because a service produces at most a few hundred actions.
+    pub fn list_operator_actions_for_session(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<Vec<OperatorActionRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, candidate_id, action_type, actor, payload_json, occurred_at_ms
+             FROM operator_actions
+             WHERE session_id = ?1
+             ORDER BY occurred_at_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], OperatorActionRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Full-text search over persisted transcript segments.
+    /// Falls back gracefully to a plain LIKE search when the FTS5 table does
+    /// not yet exist (e.g. databases migrated before v9).
+    pub fn fts_search_transcript_segments(
+        &self,
+        query: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<TranscriptSegmentRecord>> {
+        // Try FTS5 first (requires the `transcript_segments_fts` virtual table).
+        let fts_result = self.connection.prepare(
+            "SELECT ts.id, ts.session_id, ts.started_at_ms, ts.ended_at_ms,
+                    ts.speaker_label, ts.language, ts.text, ts.confidence,
+                    ts.adapter, ts.latency_ms
+             FROM transcript_segments ts
+             INNER JOIN transcript_segments_fts fts ON fts.rowid = ts.rowid
+             WHERE transcript_segments_fts MATCH ?1
+             ORDER BY ts.started_at_ms DESC
+             LIMIT ?2",
+        );
+        match fts_result {
+            Ok(mut stmt) => {
+                let rows = stmt.query_map(params![query, limit], TranscriptSegmentRecord::from_row)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+            }
+            Err(_) => {
+                // FTS table absent — fall back to substring search.
+                let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+                let mut stmt = self.connection.prepare(
+                    "SELECT id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                            language, text, confidence, adapter, latency_ms
+                     FROM transcript_segments
+                     WHERE text LIKE ?1 ESCAPE '\\'
+                     ORDER BY started_at_ms DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![pattern, limit], TranscriptSegmentRecord::from_row)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+            }
+        }
+    }
+
+    /// Upserts the installation state of an offline asset (STT model, Bible pack, etc.).
+    pub fn upsert_offline_asset_state(&self, record: &OfflineAssetStateRecord) -> StoreResult<()> {
+        self.update_offline_asset_state(record)
     }
 }
 
@@ -861,6 +1209,155 @@ impl CalibrationSampleRecord {
             outcome: row.get(4)?,
             detected_ref: row.get(5)?,
             recorded_at_ms: row.get(6)?,
+        })
+    }
+}
+
+/// Service session row (v9 wiring).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceSessionRecord {
+    pub id: String,
+    pub name: String,
+    pub started_at_ms: TimestampMs,
+    pub ended_at_ms: Option<TimestampMs>,
+    pub data_miser_enabled: bool,
+    pub offline_mode_enabled: bool,
+}
+
+impl ServiceSessionRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            started_at_ms: row.get(2)?,
+            ended_at_ms: row.get(3)?,
+            data_miser_enabled: row.get::<_, i64>(4)? != 0,
+            offline_mode_enabled: row.get::<_, i64>(5)? != 0,
+        })
+    }
+}
+
+/// Transcript segment row (v9 wiring).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscriptSegmentRecord {
+    pub id: String,
+    pub session_id: String,
+    pub started_at_ms: TimestampMs,
+    pub ended_at_ms: TimestampMs,
+    pub speaker_label: Option<String>,
+    pub language: String,
+    pub text: String,
+    pub confidence: f64,
+    pub adapter: String,
+    pub latency_ms: i64,
+}
+
+impl TranscriptSegmentRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            started_at_ms: row.get(2)?,
+            ended_at_ms: row.get(3)?,
+            speaker_label: row.get(4)?,
+            language: row.get(5)?,
+            text: row.get(6)?,
+            confidence: row.get(7)?,
+            adapter: row.get(8)?,
+            latency_ms: row.get(9)?,
+        })
+    }
+}
+
+/// Scripture candidate row (v9 wiring).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptureCandidateRecord {
+    pub id: String,
+    pub session_id: String,
+    pub reference: String,
+    pub translation_id: String,
+    pub language: String,
+    pub score: f64,
+    pub bucket: String,
+    /// `"pending"` | `"preview"` | `"live"` | `"rejected"` | `"cleared"`.
+    pub status: String,
+    pub reason: String,
+    pub created_at_ms: TimestampMs,
+}
+
+impl ScriptureCandidateRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            reference: row.get(2)?,
+            translation_id: row.get(3)?,
+            language: row.get(4)?,
+            score: row.get(5)?,
+            bucket: row.get(6)?,
+            status: row.get(7)?,
+            reason: row.get(8)?,
+            created_at_ms: row.get(9)?,
+        })
+    }
+}
+
+/// Operator action row (v9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OperatorActionRecord {
+    /// Row id, 0 on insert.
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    /// `"approve"` | `"reject"` | `"preview"` | `"live"` | `"merge"` | `"extend"` | `"clear"` | `"panic_clear"`.
+    pub action_type: String,
+    pub actor: String,
+    pub payload_json: String,
+    pub occurred_at_ms: TimestampMs,
+}
+
+impl OperatorActionRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            candidate_id: row.get(2)?,
+            action_type: row.get(3)?,
+            actor: row.get(4)?,
+            payload_json: row.get(5)?,
+            occurred_at_ms: row.get(6)?,
+        })
+    }
+}
+
+/// Display event row (v9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayEventRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    /// `"preview"` | `"live"` | `"extend"` | `"clear"` | `"panic_clear"`.
+    pub action: String,
+    /// `"projector"` | `"vmix"` | `"obs"` | `"propresenter"` | `"easyworship"` | `"all"` | ...
+    pub output_target: String,
+    pub triggered_by: String,
+    pub locked_at_ms: TimestampMs,
+    pub released_at_ms: Option<TimestampMs>,
+    pub detail_json: String,
+}
+
+impl DisplayEventRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            candidate_id: row.get(2)?,
+            action: row.get(3)?,
+            output_target: row.get(4)?,
+            triggered_by: row.get(5)?,
+            locked_at_ms: row.get(6)?,
+            released_at_ms: row.get(7)?,
+            detail_json: row.get(8)?,
         })
     }
 }
@@ -1147,6 +1644,41 @@ CREATE TABLE IF NOT EXISTS app_kv (
   value_json TEXT NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
+
+-- v9: operator actions on scripture candidates (approve, reject, merge,
+-- extend, pin). Every verdict the operator records becomes one row so that
+-- the queue is reconstructible after a mid-service crash and accuracy
+-- analytics can be computed post-service.
+CREATE TABLE IF NOT EXISTS operator_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES service_sessions(id) ON DELETE CASCADE,
+  candidate_id TEXT,
+  action_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL
+);
+
+-- v9: display events — every push to preview, take-live, extend, or clear
+-- on any output target. Lets us replay a service end-to-end and compute
+-- TTDisplay latency metrics.
+CREATE TABLE IF NOT EXISTS display_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES service_sessions(id) ON DELETE CASCADE,
+  candidate_id TEXT,
+  action TEXT NOT NULL,
+  output_target TEXT NOT NULL,
+  triggered_by TEXT NOT NULL,
+  locked_at_ms INTEGER NOT NULL,
+  released_at_ms INTEGER,
+  detail_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_actions_session_time
+  ON operator_actions(session_id, occurred_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_display_events_session_time
+  ON display_events(session_id, locked_at_ms DESC);
 "#;
 
 #[cfg(test)]

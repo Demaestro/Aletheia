@@ -54,6 +54,8 @@ export function ManualSearchFallback({
       .finally(() => setFetchingRef(null));
   };
 
+  const [loadingTranslations, setLoadingTranslations] = useState(true);
+
   const refreshTranslations = async () => {
     try {
       const list = await listBibleTranslations();
@@ -61,6 +63,8 @@ export function ManualSearchFallback({
       setLibraryError(null);
     } catch (err) {
       setLibraryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingTranslations(false);
     }
   };
 
@@ -247,22 +251,30 @@ export function ManualSearchFallback({
             {libraryError && (
               <p className="mt-2 text-xs text-red-400">Library status unavailable: {libraryError}</p>
             )}
+            {loadingTranslations ? (
+              <div className="mt-4 flex items-center gap-2 text-xs text-muted">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-muted border-t-accent" />
+                Loading library status…
+              </div>
+            ) : (
             <ul className="mt-4 space-y-3">
               {libraryRows.map((row) => {
                 const loaded = row.status?.versesLoaded ?? 0;
                 const isFull = row.status?.fullCanon ?? false;
                 return (
-                  <li key={row.id} className="rounded-[6px] border border-white/5 bg-paper p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div>
+                  <li key={row.id} className="rounded-[6px] border border-line bg-paper p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="min-w-0">
                         <p className="text-sm font-semibold text-ink">{row.id.toUpperCase()}</p>
                         <p className="text-xs text-muted">{row.name}</p>
                       </div>
-                      <StatusPill
-                        tone={isFull ? "healthy" : loaded > 0 ? "neutral" : "degraded"}
-                        label={isFull ? "Full Bible" : loaded > 0 ? "Curated" : "Not loaded"}
-                        detail={`${loaded.toLocaleString()} verses`}
-                      />
+                      <span className="flex-none">
+                        <StatusPill
+                          tone={isFull ? "healthy" : loaded > 0 ? "neutral" : "degraded"}
+                          label={isFull ? "Full Bible" : loaded > 0 ? `${loaded.toLocaleString()} verses` : "Not loaded"}
+                          detail={loaded > 0 && !isFull ? "Curated" : undefined}
+                        />
+                      </span>
                     </div>
                     {!isFull && (
                       <div className="mt-2 flex gap-2">
@@ -273,7 +285,7 @@ export function ManualSearchFallback({
                             setImportPaths((prev) => ({ ...prev, [row.id]: e.target.value }))
                           }
                           placeholder={`C:\\path\\to\\${row.id}.json`}
-                          className="h-9 flex-1 rounded-[6px] border border-white/5 bg-mist px-2 text-xs text-ink outline-none focus:border-accent"
+                          className="h-9 flex-1 min-w-0 rounded-[6px] border border-line bg-mist px-2 text-xs text-ink outline-none focus:border-accent"
                         />
                         <ActionButton
                           tone="secondary"
@@ -299,6 +311,7 @@ export function ManualSearchFallback({
                 );
               })}
             </ul>
+            )}
             {importMessage && (
               <p className="mt-3 text-xs text-muted" aria-live="polite">{importMessage}</p>
             )}
