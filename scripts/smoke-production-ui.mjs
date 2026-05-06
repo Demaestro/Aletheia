@@ -24,24 +24,25 @@ if (await openOperator.count()) {
   await openOperator.click();
 }
 
-await page.getByRole("button", { name: /run ai assist/i }).waitFor({ timeout: 10000 });
-await page.getByText("AI scripture assist").waitFor({ timeout: 10000 });
-await page.getByText("Best candidate").waitFor({ timeout: 10000 });
+await page.getByText("Bible command desk").waitFor({ timeout: 10000 });
+await page.getByText("Program monitor").waitFor({ timeout: 10000 });
+await page.getByText("Command lane").waitFor({ timeout: 10000 });
+await page.getByText("Preview and live output.").waitFor({ timeout: 10000 });
 seenText += `\n${await page.locator("body").innerText()}`;
 
 await page.locator("button").filter({ hasText: "Integrations" }).click();
-await page.getByRole("button", { name: /save config/i }).waitFor({ timeout: 10000 });
+await page.getByRole("button", { name: /save config/i }).first().waitFor({ timeout: 10000 });
 await page.getByRole("button", { name: /export booth pack/i }).click();
 await page.getByText("Booth compatibility pack", { exact: true }).waitFor({ timeout: 10000 });
 await page.getByText("Recent delivery receipts").waitFor({ timeout: 10000 });
 seenText += `\n${await page.locator("body").innerText()}`;
 
 await page.locator("button").filter({ hasText: "Health" }).click();
-await page.getByText("Production readiness").waitFor({ timeout: 10000 });
+await page.getByText("Production readiness", { exact: true }).waitFor({ timeout: 10000 });
 await page.getByText("Plugin signing", { exact: true }).waitFor({ timeout: 10000 });
 await page.getByRole("button", { name: /run local rehearsal/i }).click();
-await page.getByText("Local rehearsal runner").waitFor({ timeout: 10000 });
-await page.getByText("SQLite scripture index").waitFor({ timeout: 10000 });
+await page.getByText("Local rehearsal runner", { exact: true }).first().waitFor({ timeout: 10000 });
+await page.getByText("SQLite scripture index").first().waitFor({ state: "attached", timeout: 10000 });
 await page.getByRole("button", { name: /^export$/i }).waitFor({ timeout: 10000 });
 seenText += `\n${await page.locator("body").innerText()}`;
 
@@ -49,8 +50,9 @@ const bodyText = seenText.toLowerCase();
 const required = [
   "vmix bridge",
   "booth compatibility pack",
-  "ai scripture assist",
-  "best candidate",
+  "bible command desk",
+  "program monitor",
+  "command lane",
   "recent delivery receipts",
   "production readiness",
   "secret vault",

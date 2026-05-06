@@ -11,9 +11,10 @@ const initialRuntimeStatus: DesktopRuntimeStatus = {
   mode: "browser-fallback",
   serviceSession: "Loading local core",
   databasePath: "Checking desktop store",
-  dataMiserEnabled: true,
-  offlineModeEnabled: true,
-  destinationsArmed: true,
+  dataMiserEnabled: false,
+  offlineModeEnabled: false,
+  destinationsArmed: false,
+  operatingMode: "assisted",
   auditCount: 0,
   lastEventSequence: 0,
   checkedAtMs: Date.now()
@@ -81,7 +82,7 @@ export const useDesktopStore = create<DesktopState>((set, get) => ({
   selectedCandidate: scriptureCandidates[0] || null,
   desktopStatus: initialRuntimeStatus,
   aiDetection: initialAiDetection,
-  destinationsArmed: true,
+  destinationsArmed: false,
 
   setCandidates: (candidates) => set({ candidates }),
   

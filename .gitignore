@@ -7,3 +7,23 @@ output/
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts
+C:\dev\cargo-targets\aletheia/
+C*dev*cargo-targets*aletheia/
+NUL
+[{]
+logs.push*
+npm
+desktop-capture.png
+.venv-vector/
+__pycache__/
+api_surface.txt
+cargo_json.txt
+clippy_out*.json
+clippy_out*.txt
+target-linux/
+target-win/
+target-wsl/
+.logs/
+.claude/scheduled_tasks.lock
+# Stray directory created by mis-quoted Windows path arg (CRLF/escape glitch)
+C\357\200\272\357\201\234*/

@@ -6,12 +6,12 @@ export const cn = (...classes: Array<string | false | null | undefined>) =>
   classes.filter(Boolean).join(" ");
 
 const toneClass: Record<Tone, string> = {
-  healthy: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shadow-neon shadow-emerald-500/20",
-  degraded: "border-amber-500/30 bg-amber-500/10 text-amber-400 shadow-neon shadow-amber-500/20",
-  offline: "border-red-500/30 bg-red-500/10 text-red-400 shadow-neon shadow-red-500/20",
-  live: "border-red-500/40 bg-red-500/20 text-red-400 shadow-neon shadow-red-500/30",
-  armed: "border-violet-500/30 bg-violet-500/10 text-violet-400 shadow-neon shadow-violet-500/20",
-  neutral: "border-white/10 bg-white/5 text-white/60"
+  healthy: "border-emerald-500/35 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+  degraded: "border-amber-500/35 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+  offline: "border-red-500/35 bg-red-500/10 text-red-600 dark:text-red-400",
+  live: "border-red-500/40 bg-red-500/14 text-red-600 dark:text-red-400",
+  armed: "border-accent/35 bg-accent/10 text-accent",
+  neutral: "border-line bg-mist text-muted"
 };
 
 export const fadeUp = {
@@ -57,9 +57,9 @@ export function SectionHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-4 border-b border-white/5 pb-5 md:flex-row md:items-end md:justify-between">
+    <div className="flex flex-col gap-4 border-b border-line pb-5 md:flex-row md:items-end md:justify-between">
       <div>
-        <p className="text-xs font-semibold uppercase tracking-[0.12em] text-violet-400/80">{eyebrow}</p>
+        <p className="text-xs font-semibold uppercase tracking-[0.12em] text-accent">{eyebrow}</p>
         <h2 className="mt-2 text-2xl font-semibold tracking-tight text-ink">{title}</h2>
         {detail ? <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">{detail}</p> : null}
       </div>
@@ -73,37 +73,33 @@ export function ActionButton({
   onClick,
   tone = "primary",
   disabled = false,
-  className
+  className,
+  type = "button"
 }: {
   children: ReactNode;
   onClick?: () => void;
   tone?: "primary" | "secondary" | "danger";
   disabled?: boolean;
   className?: string;
+  type?: "button" | "submit" | "reset";
 }) {
   return (
     <motion.button
-      type="button"
+      type={type}
       whileTap={disabled ? undefined : { scale: 0.97 }}
       disabled={disabled}
       onClick={onClick}
       className={cn(
-        "group relative inline-flex min-h-10 items-center justify-center overflow-hidden rounded-[6px] px-4 text-sm font-semibold transition-all duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-500 disabled:cursor-not-allowed disabled:opacity-45 active:scale-[0.98]",
+        "group relative inline-flex min-h-10 items-center justify-center overflow-hidden rounded-[6px] px-4 text-sm font-semibold transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-45 active:scale-[0.98]",
         tone === "primary" &&
-          "bg-gradient-to-r from-violet-600 to-indigo-600 text-white ring-1 ring-white/10 shadow-[0_4px_20px_-4px_rgba(124,58,237,0.5)] hover:from-violet-500 hover:to-indigo-500 hover:shadow-[0_8px_28px_-4px_rgba(124,58,237,0.65)] active:shadow-[0_2px_10px_-2px_rgba(124,58,237,0.4)]",
+          "border border-accent/70 bg-accent text-[#04110F] hover:bg-accent/90",
         tone === "secondary" &&
-          "border border-white/10 bg-white/5 text-white/80 backdrop-blur-md hover:border-violet-400/30 hover:bg-white/[0.09] hover:text-white hover:shadow-[0_2px_12px_-2px_rgba(124,58,237,0.25)]",
+          "border border-line bg-mist text-ink hover:border-accent/40 hover:bg-paper",
         tone === "danger" &&
-          "border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:shadow-[0_4px_18px_-4px_rgba(239,68,68,0.5)]",
+          "border border-red-500/35 bg-red-500/10 text-red-500 dark:text-red-400 hover:bg-red-500/18",
         className
       )}
     >
-      {tone === "primary" ? (
-        <span
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent"
-        />
-      ) : null}
       <span className="relative z-10 inline-flex items-center">{children}</span>
     </motion.button>
   );
@@ -123,7 +119,7 @@ export function ConfidenceBar({ value }: { value: number }) {
         <span>Confidence</span>
         <span className="font-mono text-ink">{value}%</span>
       </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-white/5 ring-1 ring-white/5" aria-hidden="true">
+      <div className="h-1.5 overflow-hidden rounded-full bg-line ring-1 ring-line" aria-hidden="true">
         <div
           className={cn("h-full rounded-full transition-[width] duration-500 ease-out", tone)}
           style={{ width: `${value}%` }}
@@ -151,8 +147,8 @@ export function CandidateRow({
       className={cn(
         "group rounded-[6px] border p-4 transition-all duration-200 ease-out",
         active
-          ? "border-violet-500/40 bg-gradient-to-br from-violet-500/10 to-transparent shadow-[0_8px_30px_-8px_rgba(124,58,237,0.3)]"
-          : "border-white/8 bg-white/[0.03] hover:border-violet-400/30 hover:bg-white/[0.05] hover:shadow-[0_4px_20px_-8px_rgba(124,58,237,0.2)]"
+          ? "border-accent/45 bg-accent/10 shadow-[inset_3px_0_0_var(--c-accent)]"
+          : "border-line bg-paper hover:border-accent/35 hover:bg-mist"
       )}
     >
       <div className="flex items-start justify-between gap-4">
@@ -194,9 +190,9 @@ export function OutputCanvas({
   return (
     <div
       className={cn(
-        "overflow-hidden rounded-[6px] border border-white/10 bg-[#0c0e12]",
+        "overflow-hidden rounded-[6px] border border-line bg-[#050607]",
         state === "live" &&
-          "shadow-[inset_0_0_0_1px_rgba(244,63,94,0.15),0_0_28px_-12px_rgba(244,63,94,0.5)]"
+          "shadow-[inset_0_0_0_1px_rgba(240,82,82,0.22)]"
       )}
     >
       {label ? (
@@ -211,7 +207,7 @@ export function OutputCanvas({
           </span>
         </div>
       )}
-      <div className="flex min-h-[140px] flex-col justify-end bg-[#0c0e12] p-4 text-white">
+      <div className="flex min-h-[140px] flex-col justify-end bg-[#050607] p-4 text-white">
         <motion.div key={candidate.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.18 }}>
           <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/50">
             {candidate.reference} · {candidate.translation}
@@ -235,7 +231,7 @@ export function Metric({
   detail: string;
 }) {
   return (
-    <div className="border-l border-white/5 pl-4">
+    <div className="border-l border-line pl-4">
       <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted">{label}</p>
       <p className="mt-2 text-xl font-semibold text-ink">{value}</p>
       <p className="mt-1 text-sm text-muted">{detail}</p>

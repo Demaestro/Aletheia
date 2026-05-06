@@ -46,6 +46,11 @@ impl SttReadiness {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SttRoutingPolicy {
     pub data_miser_enabled: bool,
+    /// Hard offline mode. When true, no audio leaves the machine no matter
+    /// what other flags say — this is the operator-facing "Offline" toggle
+    /// in the runtime UI and the architectural-vision "zero cloud calls"
+    /// guarantee. Overrides `cloud_allowed` and `hybrid_allowed`.
+    pub offline_mode_enabled: bool,
     pub offline_preferred: bool,
     pub cloud_allowed: bool,
     pub hybrid_allowed: bool,
@@ -57,6 +62,7 @@ impl Default for SttRoutingPolicy {
     fn default() -> Self {
         Self {
             data_miser_enabled: true,
+            offline_mode_enabled: false,
             offline_preferred: true,
             cloud_allowed: true,
             hybrid_allowed: true,
@@ -80,12 +86,17 @@ pub struct SttRouter;
 
 impl SttRouter {
     pub fn route(&self, policy: &SttRoutingPolicy, readiness: &SttReadiness) -> SttRoutingPlan {
+        // Hard offline mode: if the operator (or the architectural-vision
+        // safety default) has set offline_mode_enabled, every cloud or
+        // hybrid path is closed regardless of cloud_allowed/hybrid_allowed
+        // or readiness.
+        let cloud_permitted =
+            !policy.offline_mode_enabled && policy.cloud_allowed && !policy.data_miser_enabled;
+        let hybrid_permitted =
+            !policy.offline_mode_enabled && policy.hybrid_allowed && !policy.data_miser_enabled;
+
         if readiness.offline_models_ready {
-            if policy.hybrid_allowed
-                && readiness.cloud_ready
-                && !policy.data_miser_enabled
-                && cloud_latency_ok(policy, readiness)
-            {
+            if hybrid_permitted && readiness.cloud_ready && cloud_latency_ok(policy, readiness) {
                 return SttRoutingPlan {
                     mode: SttMode::Hybrid,
                     adapter_id: "stt-hybrid".to_string(),
@@ -102,11 +113,7 @@ impl SttRouter {
             };
         }
 
-        if policy.cloud_allowed
-            && readiness.cloud_ready
-            && !policy.data_miser_enabled
-            && cloud_latency_ok(policy, readiness)
-        {
+        if cloud_permitted && readiness.cloud_ready && cloud_latency_ok(policy, readiness) {
             return SttRoutingPlan {
                 mode: SttMode::Cloud,
                 adapter_id: "stt-cloud".to_string(),
@@ -114,11 +121,15 @@ impl SttRouter {
             };
         }
 
+        let reason = if policy.offline_mode_enabled {
+            "Offline mode is enabled; no cloud or hybrid route is permitted.".to_string()
+        } else {
+            "STT routing blocked: install offline models or allow cloud fallback.".to_string()
+        };
         SttRoutingPlan {
             mode: SttMode::Offline,
             adapter_id: "stt-blocked".to_string(),
-            reason: "STT routing blocked: install offline models or allow cloud fallback."
-                .to_string(),
+            reason,
         }
     }
 }
@@ -142,7 +153,7 @@ mod tests {
             cloud_ready: true,
             last_cloud_latency_ms: Some(120),
         };
-        let plan = SttRouter::default().route(&policy, &readiness);
+        let plan = SttRouter.route(&policy, &readiness);
         assert_eq!(plan.mode, SttMode::Offline);
     }
 
@@ -157,7 +168,7 @@ mod tests {
             cloud_ready: true,
             last_cloud_latency_ms: Some(110),
         };
-        let plan = SttRouter::default().route(&policy, &readiness);
+        let plan = SttRouter.route(&policy, &readiness);
         assert_eq!(plan.mode, SttMode::Hybrid);
     }
 
@@ -172,8 +183,40 @@ mod tests {
             cloud_ready: true,
             last_cloud_latency_ms: Some(140),
         };
-        let plan = SttRouter::default().route(&policy, &readiness);
+        let plan = SttRouter.route(&policy, &readiness);
         assert_eq!(plan.mode, SttMode::Cloud);
+    }
+
+    #[test]
+    fn offline_mode_blocks_cloud_and_hybrid() {
+        let policy = SttRoutingPolicy {
+            data_miser_enabled: false,
+            offline_mode_enabled: true,
+            ..SttRoutingPolicy::default()
+        };
+        // Even with offline ready and cloud also ready, hybrid is forbidden.
+        let with_offline = SttRouter.route(
+            &policy,
+            &SttReadiness {
+                offline_models_ready: true,
+                cloud_ready: true,
+                last_cloud_latency_ms: Some(80),
+            },
+        );
+        assert_eq!(with_offline.mode, SttMode::Offline);
+        assert_eq!(with_offline.adapter_id, "stt-local");
+
+        // With no offline models, cloud is also forbidden — must block.
+        let no_offline = SttRouter.route(
+            &policy,
+            &SttReadiness {
+                offline_models_ready: false,
+                cloud_ready: true,
+                last_cloud_latency_ms: Some(80),
+            },
+        );
+        assert_eq!(no_offline.adapter_id, "stt-blocked");
+        assert!(no_offline.reason.to_lowercase().contains("offline mode"));
     }
 
     #[test]
@@ -184,7 +227,7 @@ mod tests {
             cloud_ready: true,
             last_cloud_latency_ms: Some(100),
         };
-        let plan = SttRouter::default().route(&policy, &readiness);
+        let plan = SttRouter.route(&policy, &readiness);
         assert_eq!(plan.adapter_id, "stt-blocked");
     }
 }

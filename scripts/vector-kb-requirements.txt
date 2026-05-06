@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.7.1+cpu; platform_system == "Linux"
+torch>=2.7,<3; platform_system != "Linux"
+faiss-cpu>=1.8,<2
+sentence-transformers>=3,<6
+numpy>=1.26,<3

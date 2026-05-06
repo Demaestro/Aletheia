@@ -6,37 +6,36 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   font-family: Outfit, Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
-  background: #020617;
+  background: #070708;
 
-  /* Design tokens — consumed by tailwind.config.ts colors.* via var(). */
-  --c-ink: #F8FAFC;
-  --c-graphite: #94A3B8;
-  --c-muted: #64748B;
-  --c-line: #1E293B;
-  --c-mist: #0F172A;
-  --c-paper: #020617;
-  --c-accent: #8B5CF6;
+  --c-ink: #F4F5F6;
+  --c-graphite: #B8C0CC;
+  --c-muted: #7C8796;
+  --c-line: #24282E;
+  --c-mist: #15181C;
+  --c-paper: #0D0F12;
+  --c-accent: #2DD4BF;
   --c-caution: #F59E0B;
-  --c-danger: #EF4444;
-  --c-app-bg: #020617;
-  --c-app-fg: #F8FAFC;
+  --c-danger: #F05252;
+  --c-app-bg: #070708;
+  --c-app-fg: #F4F5F6;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  background: #F8FAFC;
+  background: #F7F8FA;
 
-  --c-ink: #0F172A;
-  --c-graphite: #334155;
-  --c-muted: #475569;
-  --c-line: #E2E8F0;
-  --c-mist: #F1F5F9;
+  --c-ink: #101418;
+  --c-graphite: #3D4753;
+  --c-muted: #667280;
+  --c-line: #DCE1E7;
+  --c-mist: #EEF2F5;
   --c-paper: #FFFFFF;
-  --c-accent: #7C3AED;
-  --c-caution: #D97706;
-  --c-danger: #DC2626;
-  --c-app-bg: #F8FAFC;
-  --c-app-fg: #0F172A;
+  --c-accent: #0D9488;
+  --c-caution: #B45309;
+  --c-danger: #C24141;
+  --c-app-bg: #F7F8FA;
+  --c-app-fg: #101418;
 }
 
 * {
@@ -71,7 +70,7 @@ button:disabled {
 }
 
 ::selection {
-  background: rgba(21, 122, 92, 0.18);
+  background: rgba(45, 212, 191, 0.22);
 }
 
 .functional-panel {

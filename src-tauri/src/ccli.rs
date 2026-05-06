@@ -143,10 +143,10 @@ pub fn log_ccli_usage(
             .entries
             .lock()
             .map_err(|_| "ccli cache poisoned".to_string())?;
-        if let Some(recent) = entries.iter().find(|e| e.ccli_number == ccli_number) {
-            if now.saturating_sub(recent.sent_live_at_ms) < CCLI_DEDUPE_WINDOW_MS {
-                return Ok(recent.clone());
-            }
+        if let Some(recent) = entries.iter().find(|e| e.ccli_number == ccli_number)
+            && now.saturating_sub(recent.sent_live_at_ms) < CCLI_DEDUPE_WINDOW_MS
+        {
+            return Ok(recent.clone());
         }
     }
 
@@ -196,9 +196,8 @@ pub fn export_ccli_usage_csv(state: State<'_, DesktopState>) -> Result<String, S
         .entries
         .lock()
         .map_err(|_| "ccli cache poisoned".to_string())?;
-    let mut out = String::from(
-        "ccli_number,song_title,sent_live_at_iso,service_session_id,operator\n",
-    );
+    let mut out =
+        String::from("ccli_number,song_title,sent_live_at_iso,service_session_id,operator\n");
     for e in entries.iter() {
         let iso = iso_from_ms(e.sent_live_at_ms);
         out.push_str(&format!(
@@ -230,7 +229,11 @@ fn iso_from_ms(ms: u64) -> String {
     let z = days_since_epoch as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
-    let yoe = (doe.saturating_sub(doe / 1460).saturating_sub(doe / 36524).saturating_add(doe / 146096)) / 365;
+    let yoe = (doe
+        .saturating_sub(doe / 1460)
+        .saturating_sub(doe / 36524)
+        .saturating_add(doe / 146096))
+        / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;

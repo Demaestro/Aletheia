@@ -128,7 +128,7 @@ impl CompanionAdapter {
         // Probing internal/current_time (which usually exists)
         // prevents a valid 404 on an unconfigured custom variable from failing health checks.
         let path = "/api/variables/internal/current_time";
-        let response = self.request("GET", &path, None)?;
+        let response = self.request("GET", path, None)?;
         // 404 still proves the HTTP server is alive; treat 4xx other than 401/403
         // as "reachable but the variable is not configured yet".
         if response.status_code == 401 || response.status_code == 403 {
@@ -212,7 +212,15 @@ impl CompanionAdapter {
     ) -> Result<CompanionHttpResponse, CompanionError> {
         let timeout = Duration::from_millis(self.config.timeout_ms);
         let stream = connect_checked(&self.config, timeout)?;
-        request_over_stream(stream, &self.config.host, method, path, body, content_type, timeout)
+        request_over_stream(
+            stream,
+            &self.config.host,
+            method,
+            path,
+            body,
+            content_type,
+            timeout,
+        )
     }
 }
 
@@ -347,9 +355,7 @@ fn connect_checked(
     let addresses = (config.host.as_str(), config.port)
         .to_socket_addrs()
         .map_err(|e| {
-            CompanionError::ConnectionFailed(format!(
-                "could not resolve Companion endpoint: {e}"
-            ))
+            CompanionError::ConnectionFailed(format!("could not resolve Companion endpoint: {e}"))
         })?;
 
     for address in addresses {
@@ -445,9 +451,7 @@ fn parse_http_response(bytes: &[u8]) -> Result<CompanionHttpResponse, CompanionE
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| {
-            CompanionError::MalformedResponse(
-                "Companion response had no status code".to_string(),
-            )
+            CompanionError::MalformedResponse("Companion response had no status code".to_string())
         })?
         .parse::<u16>()
         .map_err(|_| {

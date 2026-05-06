@@ -382,14 +382,13 @@ mod tests {
     }
 
     fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "aletheia-ew-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos()
-        ));
-        path
+        ))
     }
 
     #[test]

@@ -279,78 +279,188 @@ pub struct OfflineAssetManifest {
 
 /// Default packaged asset plan for the Nigeria-first local build.
 pub fn production_offline_asset_manifest() -> OfflineAssetManifest {
-    fn asset(
-        id: &str,
-        kind: &str,
-        label: &str,
-        language: &str,
-        license: &str,
-        state: &str,
+    struct AssetConfig<'a> {
+        id: &'a str,
+        kind: &'a str,
+        label: &'a str,
+        language: &'a str,
+        license: &'a str,
+        state: &'a str,
         size_mb: u32,
         required_for_release: bool,
         // Real SHA-256 the operator must supply when installing from file.
         // Empty string means "not yet known / not a file-based asset".
-        expected_checksum: &str,
-    ) -> OfflineAsset {
+        expected_checksum: &'a str,
+    }
+
+    fn asset(config: AssetConfig<'_>) -> OfflineAsset {
         OfflineAsset {
-            id: id.to_string(),
-            kind: kind.to_string(),
-            label: label.to_string(),
-            language: language.to_string(),
-            license: license.to_string(),
-            state: state.to_string(),
-            size_mb,
-            checksum_sha256: if !expected_checksum.is_empty() {
-                expected_checksum.to_string()
-            } else if state == "installed" {
+            id: config.id.to_string(),
+            kind: config.kind.to_string(),
+            label: config.label.to_string(),
+            language: config.language.to_string(),
+            license: config.license.to_string(),
+            state: config.state.to_string(),
+            size_mb: config.size_mb,
+            checksum_sha256: if !config.expected_checksum.is_empty() {
+                config.expected_checksum.to_string()
+            } else if config.state == "installed" {
                 "packaged-at-build".to_string()
             } else {
                 "pending-download".to_string()
             },
-            required_for_release,
+            required_for_release: config.required_for_release,
         }
     }
 
+    macro_rules! asset {
+        ($id:expr, $kind:expr, $label:expr, $language:expr, $license:expr, $state:expr, $size_mb:expr, $required_for_release:expr, $expected_checksum:expr $(,)?) => {
+            asset(AssetConfig {
+                id: $id,
+                kind: $kind,
+                label: $label,
+                language: $language,
+                license: $license,
+                state: $state,
+                size_mb: $size_mb,
+                required_for_release: $required_for_release,
+                expected_checksum: $expected_checksum,
+            })
+        };
+    }
+
     // Real SHA-256 checksums computed from the downloaded ggml model files:
-    //   ggml-base.en.bin      (141 MB, English-only)
+    //   ggml-small.en.bin     (466 MB, English-only)
     //   ggml-base.bin         (142 MB, multilingual — covers all 7 languages)
-    const CHECKSUM_EN: &str =
-        "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
-    const CHECKSUM_MULTI: &str =
-        "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe";
+    const CHECKSUM_EN: &str = "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d";
+    const CHECKSUM_MULTI: &str = "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe";
 
     let assets = vec![
         // Scripture assets — bundled at build time, no file install required.
-        asset("bible-kjv", "scripture", "King James Version",
-              "English", "public-domain", "installed", 5, true, ""),
-        asset("bible-web", "scripture", "World English Bible",
-              "English", "public-domain", "installed", 7, true, ""),
-
+        asset!(
+            "bible-kjv",
+            "scripture",
+            "King James Version",
+            "English",
+            "public-domain",
+            "installed",
+            5,
+            true,
+            "",
+        ),
+        asset!(
+            "bible-web",
+            "scripture",
+            "World English Bible",
+            "English",
+            "public-domain",
+            "installed",
+            7,
+            true,
+            "",
+        ),
         // Scripture alias bundles — compiled into the binary.
-        asset("aliases-yoruba",  "scripture-aliases", "Yoruba book aliases",
-              "Yoruba",  "internal-index", "installed", 1, true, ""),
-        asset("aliases-igbo",    "scripture-aliases", "Igbo book aliases",
-              "Igbo",    "internal-index", "installed", 1, true, ""),
-        asset("aliases-hausa",   "scripture-aliases", "Hausa book aliases",
-              "Hausa",   "internal-index", "installed", 1, true, ""),
-        asset("aliases-twi",     "scripture-aliases", "Twi book aliases",
-              "Twi",     "internal-index", "installed", 1, true, ""),
-        asset("aliases-swahili", "scripture-aliases", "Swahili book aliases",
-              "Swahili", "internal-index", "installed", 1, true, ""),
-        asset("aliases-xhosa",   "scripture-aliases", "Xhosa book aliases",
-              "Xhosa",   "internal-index", "installed", 1, true, ""),
-        asset("aliases-spanish", "scripture-aliases", "Spanish book aliases",
-              "Spanish",  "internal-index", "installed", 1, true, ""),
-        asset("aliases-french",  "scripture-aliases", "French book aliases",
-              "French",   "internal-index", "installed", 1, true, ""),
-
-        // STT model: Whisper base (English-only, 141 MB).
-        // File: ggml-base.en.bin  —  install via Health → Offline Model Packs.
-        asset("stt-whisper-en-small", "stt-model",
-              "Offline English STT (Whisper base)",
-              "English", "operator-provided-model", "pending",
-              142, true, CHECKSUM_EN),
-
+        asset!(
+            "aliases-yoruba",
+            "scripture-aliases",
+            "Yoruba book aliases",
+            "Yoruba",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-igbo",
+            "scripture-aliases",
+            "Igbo book aliases",
+            "Igbo",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-hausa",
+            "scripture-aliases",
+            "Hausa book aliases",
+            "Hausa",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-twi",
+            "scripture-aliases",
+            "Twi book aliases",
+            "Twi",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-swahili",
+            "scripture-aliases",
+            "Swahili book aliases",
+            "Swahili",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-xhosa",
+            "scripture-aliases",
+            "Xhosa book aliases",
+            "Xhosa",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-spanish",
+            "scripture-aliases",
+            "Spanish book aliases",
+            "Spanish",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        asset!(
+            "aliases-french",
+            "scripture-aliases",
+            "French book aliases",
+            "French",
+            "internal-index",
+            "installed",
+            1,
+            true,
+            "",
+        ),
+        // STT model: Whisper small.en (English-only, 466 MB).
+        // File: ggml-small.en.bin  —  install via Health → Offline Model Packs.
+        asset!(
+            "stt-whisper-en-small",
+            "stt-model",
+            "Offline English STT (Whisper small.en)",
+            "English",
+            "operator-provided-model",
+            "pending",
+            466,
+            true,
+            CHECKSUM_EN,
+        ),
         // STT model: Whisper base multilingual (142 MB).
         // ONE physical file — ggml-base.bin — handles every non-English locale
         // we care about. Listing eight aliased packs of the same file misled
@@ -358,7 +468,7 @@ pub fn production_offline_asset_manifest() -> OfflineAssetManifest {
         // multilingual pack is now surfaced once; per-language behaviour is
         // selected at inference time via the `language_hint` argument to
         // start_audio_capture.
-        asset(
+        asset!(
             "stt-whisper-multilingual",
             "stt-model",
             "Offline multilingual STT (Whisper base, 99 languages)",
@@ -863,7 +973,7 @@ mod tests {
         // Build a manifest where every required asset is installed so we can
         // isolate the plugin-signing-key blocker without the offline-asset
         // blocker also firing. (The default manifest reports `blocked` because
-        // ggml-base.en.bin must be operator-installed.)
+        // ggml-small.en.bin must be operator-installed.)
         let mut assets = production_offline_asset_manifest();
         for asset in assets.assets.iter_mut() {
             if asset.required_for_release {

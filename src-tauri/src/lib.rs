@@ -3,7 +3,12 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use aletheia_companion::CompanionAdapter;
 use aletheia_core::{ServiceSessionId, now_ms};
+use aletheia_detection::calibration::IsotonicCalibration;
+use aletheia_detection::cross_encoder::{SharedCrossEncoder, default_cross_encoder};
+use aletheia_detection::cross_refs::{CrossRefGraph, RecentVerseHistory};
+use aletheia_detection::embeddings::{SharedEmbedder, default_embedder};
 use aletheia_detection::{
     AccuracyFixture, KeywordLanguageDetector, LanguageDetector, ReferenceKeywordDetector,
     ScriptureDetector, SupportedLanguage, TranscriptSegment as DetectionTranscriptSegment,
@@ -11,14 +16,13 @@ use aletheia_detection::{
 };
 use aletheia_easyworship::EasyWorshipAdapter;
 use aletheia_obs::ObsAdapter;
-use aletheia_propresenter::ProPresenterAdapter;
-use aletheia_companion::CompanionAdapter;
 use aletheia_ops::{
     AcceptanceDevice, OfflineAssetManifest, VerifiedPluginManifest,
     production_offline_asset_manifest,
 };
 use aletheia_osc::OscAdapter;
 use aletheia_output::{OutputAdapter, OutputHealth, OutputLayer, OutputScene};
+use aletheia_propresenter::ProPresenterAdapter;
 use aletheia_store::ServiceProfileRecord;
 use aletheia_store::{
     AletheiaStore, IntegrationConfigRecord, OfflineAssetStateRecord, TranslationRecord,
@@ -31,29 +35,53 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
-mod vault;
-pub mod dto;
-pub mod commands;
 pub mod audit;
-pub mod health;
-pub mod rehearsal;
 pub mod ccli;
+pub mod commands;
+pub mod dto;
 pub mod fleet;
-pub mod stream_server;
+pub mod health;
 pub mod kv;
+pub mod rehearsal;
+pub mod scripture_search;
+pub mod stream_server;
+mod vault;
 
+pub fn vector_kb_health(timeout: std::time::Duration) -> Result<String, String> {
+    let service_url = std::env::var("ALETHEIA_VECTOR_KB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:47618".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| format!("Vector KB health client failed: {error}"))?
+        .get(format!("{service_url}/health"))
+        .send()
+        .map_err(|error| format!("Vector KB sidecar offline at {service_url}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Vector KB sidecar returned HTTP {} at {service_url}/health.",
+            response.status()
+        ));
+    }
+    response
+        .text()
+        .map_err(|error| format!("Vector KB health response unreadable: {error}"))
+}
+
+use crate::ccli::{CcliUsageCache, export_ccli_usage_csv, list_ccli_usage, log_ccli_usage};
 use crate::commands::*;
 use crate::dto::*;
-use crate::ccli::{
-    export_ccli_usage_csv, list_ccli_usage, log_ccli_usage, CcliUsageCache,
-};
 use crate::fleet::{get_fleet_public_key, sign_fleet_bundle, verify_fleet_bundle};
-use crate::stream_server::{
-    get_stream_overlay_server_status, start_stream_overlay_server,
-    stop_stream_overlay_server, update_stream_overlay_state, StreamOverlayServer,
-};
 use crate::kv::{kv_delete, kv_get, kv_list_keys, kv_set};
-
+use crate::scripture_search::{
+    get_scripture_health, run_scripture_diagnostics, search_scripture_unified_cmd,
+};
+use crate::stream_server::{
+    StreamOverlayServer, get_stream_overlay_server_status, start_stream_overlay_server,
+    stop_stream_overlay_server, update_stream_overlay_state,
+};
 
 pub struct DesktopState {
     store: Mutex<AletheiaStore>,
@@ -64,13 +92,17 @@ pub struct DesktopState {
     companion: Mutex<CompanionAdapter>,
     osc: Mutex<OscAdapter>,
     easyworship: Mutex<EasyWorshipAdapter>,
-    database_path: PathBuf,
+    pub database_path: PathBuf,
     /// Loaded Whisper model — shared with the background transcription task.
     stt_adapter: Arc<Mutex<Option<OfflineSttAdapter>>>,
     /// Dropping the SyncSender signals the capture thread to stop the stream.
     /// cpal::Stream is !Send on Windows, so AudioCapture lives on its own
     /// dedicated std::thread rather than in this shared state struct.
     capture_shutdown: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    /// Guards the startup gap between the frontend requesting capture and the
+    /// background thread storing its shutdown handle. Without this, React dev
+    /// remounts can race two capture starts before `capture_shutdown` is set.
+    capture_starting: Mutex<bool>,
     /// Rolling buffer of the most recent live transcript segments (newest first).
     /// Capped to LIVE_TRANSCRIPT_CAPACITY to avoid unbounded growth during long
     /// services. Populated by the STT inference task in start_audio_capture and
@@ -80,6 +112,22 @@ pub struct DesktopState {
     pub ccli_usage: CcliUsageCache,
     /// Local HTTP server for the stream overlay browser source.
     pub stream_overlay: StreamOverlayServer,
+    /// Stage C — biblical context priors. Treasury-of-Scripture-Knowledge-style
+    /// adjacency map loaded from `offline-assets/cross-refs.json` at startup.
+    /// Empty-fallback when the file is absent (multipliers degrade to 1.0).
+    pub cross_ref_graph: Arc<CrossRefGraph>,
+    /// Stage C — rolling buffer of references that recently fired live.
+    /// Used as the "context" side of the cross-reference prior.
+    pub recent_history: Mutex<RecentVerseHistory>,
+    /// Stage A — bi-encoder. Default fallback is the deterministic
+    /// hashed-char-n-gram embedder (no model file). Replaceable at runtime
+    /// when an ONNX model is dropped in.
+    pub embedder: SharedEmbedder,
+    /// Stage B — cross-encoder reranker. Default is the heuristic reranker.
+    pub cross_encoder: SharedCrossEncoder,
+    /// Stage D — per-translation isotonic calibrations. Identity until
+    /// `recompute_calibration` is invoked with enough samples.
+    pub calibrations: Mutex<HashMap<String, IsotonicCalibration>>,
 }
 
 const LIVE_TRANSCRIPT_CAPACITY: usize = 50;
@@ -105,6 +153,28 @@ pub struct RuntimeState {
     /// Human-readable operator name shown in audit logs.
     #[serde(default = "default_operator_name")]
     pub operator_name: String,
+    /// First-class operating mode (Manual/Assisted/Auto/Rehearsal/Mock).
+    /// Persisted as a string for forward-compat; parsed via
+    /// `aletheia_detection::OperatingMode::from_str`. Defaults to
+    /// `Assisted` — the architectural-vision safe default.
+    #[serde(default = "default_operating_mode")]
+    pub operating_mode: String,
+    /// Translation packs that the stream-overlay fan-out will resolve
+    /// alongside the live translation. Lower-cased pack ids (e.g. `"kjv"`,
+    /// `"niv"`). Empty list means "do not fan out" — stream overlay shows
+    /// only the live translation.
+    #[serde(default = "default_translation_packs")]
+    pub translation_packs: Vec<String>,
+}
+
+fn default_translation_packs() -> Vec<String> {
+    vec!["kjv".to_string()]
+}
+
+fn default_operating_mode() -> String {
+    aletheia_detection::OperatingMode::default()
+        .as_str()
+        .to_string()
 }
 
 fn default_operator_name() -> String {
@@ -129,45 +199,14 @@ fn default_runtime_state() -> RuntimeState {
         data_miser_enabled: true,
         offline_mode_enabled: true,
         operator_name: default_operator_name(),
+        operating_mode: default_operating_mode(),
+        translation_packs: default_translation_packs(),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Serialised row from the `trusted_plugins` registry (v6).
 
 /// Aggregated calibration accuracy report (v6).
-
 
 impl DesktopState {
     fn open(database_path: impl AsRef<Path>) -> Result<Self, String> {
@@ -180,61 +219,109 @@ impl DesktopState {
             )
         })?;
 
-        seed_scripture_library(&store)?;
-        seed_offline_assets(&store)?;
-
-        // Auto-install STT model files if found in the user's Downloads folder.
-        // SHA256-hashing and copying 141 MB files MUST happen off the main thread
-        // or Tauri's setup() blocks and Windows labels the window "Not Responding".
-        let asset_root = database_path
+        // Move every seed pass off the Tauri setup hook. Each one writes to
+        // SQLite, and even with the warm-DB fast paths the cumulative
+        // synchronous cost was the dominant contributor to the cold-start
+        // lag the architectural-vision target (≤ 2 s) calls out. SQLite WAL
+        // permits a second connection from the background thread, so we open
+        // a dedicated handle there rather than fighting for the main mutex.
+        //
+        // The seeds are idempotent: scripture seeding fast-paths when ≥ 1 000
+        // KJV verses are present, and offline-asset state rows use UPSERT.
+        // Order matters only in the cold-DB case (no rows yet); in that case
+        // the UI will simply return empty results until the background task
+        // finishes, which we accept as graceful degradation per the
+        // architectural-vision "never block on startup" rule.
+        let app_dir = database_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("offline-assets");
+            .to_path_buf();
+        let asset_root = app_dir.join("offline-assets");
+        // Load the operator-editable topic catalog (no-op if the file is
+        // absent). Cheap synchronous step: just one small JSON read.
+        crate::scripture_search::init_runtime_catalog(&app_dir);
         {
-            let db_bg   = database_path.clone();
+            let db_bg = database_path.clone();
             let root_bg = asset_root.clone();
+            let app_dir_bg = app_dir.clone();
             std::thread::spawn(move || {
-                match AletheiaStore::open_file(&db_bg) {
-                    Ok(bg_store) => auto_seed_stt_models(&bg_store, &root_bg),
-                    Err(e) => log::warn!("[stt-seed] bg store open failed: {e}"),
+                let bg_store = match AletheiaStore::open_file(&db_bg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("[bg-seed] could not open store: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = seed_scripture_library(&bg_store) {
+                    log::warn!("[bg-seed] scripture library seed failed: {e}");
+                }
+                if let Err(e) = seed_offline_assets(&bg_store) {
+                    log::warn!("[bg-seed] offline asset seed failed: {e}");
+                }
+                auto_seed_stt_models(&bg_store, &root_bg);
+                if std::env::var("ALETHEIA_RUN_STARTUP_SCRIPTURE_SELF_TEST")
+                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                {
+                    crate::scripture_search::run_scripture_self_test(&bg_store, &app_dir_bg);
+                } else {
+                    log::info!(
+                        "[startup] scripture self-test skipped; run explicit diagnostics/regression instead"
+                    );
+                }
+                let kjv_count = bg_store.count_verses_for_translation("kjv").unwrap_or(0);
+                // Drop the writer-side connection before the semantic warm so
+                // the read-only WAL connection it opens can run unimpeded.
+                drop(bg_store);
+                // Only warm KJV when the full canon is already present. A
+                // partial warm here would cache a crippled semantic index and
+                // keep missing valid Old Testament paraphrases for the rest of
+                // the session.
+                if kjv_count >= 30_000
+                    && std::env::var("ALETHEIA_WARM_SCRIPTURE_ON_STARTUP")
+                        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false)
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    crate::scripture_search::warm_translation_with_path(&db_bg, "kjv");
+                } else {
+                    log::info!(
+                        "[startup] semantic warm skipped; lazy/vector search remains available"
+                    );
                 }
             });
         }
 
         // Try to restore persisted runtime state; fall back to defaults.
         let runtime = match store.load_runtime_state().ok().flatten() {
-            Some(json) => {
-                serde_json::from_str::<RuntimeState>(&json).unwrap_or_else(|_| {
-                    log::warn!("[session] saved state is invalid — starting fresh");
-                    default_runtime_state()
-                })
-            }
+            Some(json) => serde_json::from_str::<RuntimeState>(&json).unwrap_or_else(|_| {
+                log::warn!("[session] saved state is invalid — starting fresh");
+                default_runtime_state()
+            }),
             None => default_runtime_state(),
         };
 
         let vmix_config = load_vmix_config(&store)?;
 
-        // Pre-load the Whisper STT model in a background thread so it is
-        // ready the moment the operator opens the Transcript screen.
-        // The 142 MB ggml file typically loads in 1-2 s on an SSD.
+        // Whisper model auto-preload was crashing the Tauri shell on this build
+        // (the small.en ggml repeatedly re-initialised compute buffers and
+        // exited 0xcfffffff). The model is still detected and loaded lazily on
+        // first capture or via the explicit "Reload model" button, so the
+        // operator gets full STT functionality without a startup hang.
+        let _ = asset_root.clone();
         let stt_adapter: Arc<Mutex<Option<OfflineSttAdapter>>> = Arc::new(Mutex::new(None));
-        {
-            let stt_bg  = stt_adapter.clone();
-            let root_bg = asset_root.clone();
-            std::thread::spawn(move || {
-                match find_stt_model_path(&root_bg) {
-                    Ok(path) => match OfflineSttAdapter::load(&path) {
-                        Ok(adapter) => {
-                            if let Ok(mut g) = stt_bg.lock() {
-                                *g = Some(adapter);
-                            }
-                            log::info!("[stt] auto-loaded model: {}", path.display());
-                        }
-                        Err(e) => log::warn!("[stt] auto-load failed: {e}"),
-                    },
-                    Err(_) => log::info!("[stt] no installed model found for auto-load"),
-                }
-            });
+
+        // Stage C: load TSK-style cross-reference graph if present. Missing or
+        // unparseable file is treated as an empty graph (priors become no-ops).
+        let cross_ref_path = asset_root.join("cross-refs.json");
+        let cross_ref_graph = Arc::new(
+            CrossRefGraph::load_from_file(&cross_ref_path).unwrap_or_else(CrossRefGraph::empty),
+        );
+        if !cross_ref_graph.is_empty() {
+            log::info!(
+                "[detection] cross-ref graph loaded: {} source refs",
+                cross_ref_graph.len()
+            );
         }
 
         Ok(Self {
@@ -249,11 +336,17 @@ impl DesktopState {
             database_path,
             stt_adapter,
             capture_shutdown: Mutex::new(None),
+            capture_starting: Mutex::new(false),
             live_transcript: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
                 LIVE_TRANSCRIPT_CAPACITY,
             ))),
             ccli_usage: CcliUsageCache::default(),
             stream_overlay: StreamOverlayServer::default(),
+            cross_ref_graph,
+            recent_history: Mutex::new(RecentVerseHistory::new(8)),
+            embedder: default_embedder(),
+            cross_encoder: default_cross_encoder(),
+            calibrations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -299,7 +392,9 @@ impl DesktopState {
             .map_err(|_| "OBS adapter lock is unavailable; restart Aletheia".to_string())
     }
 
-    pub fn lock_propresenter(&self) -> Result<std::sync::MutexGuard<'_, ProPresenterAdapter>, String> {
+    pub fn lock_propresenter(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ProPresenterAdapter>, String> {
         self.propresenter
             .lock()
             .map_err(|_| "ProPresenter adapter lock is unavailable; restart Aletheia".to_string())
@@ -317,7 +412,9 @@ impl DesktopState {
             .map_err(|_| "OSC adapter lock is unavailable; restart Aletheia".to_string())
     }
 
-    pub fn lock_easyworship(&self) -> Result<std::sync::MutexGuard<'_, EasyWorshipAdapter>, String> {
+    pub fn lock_easyworship(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, EasyWorshipAdapter>, String> {
         self.easyworship
             .lock()
             .map_err(|_| "EasyWorship adapter lock is unavailable; restart Aletheia".to_string())
@@ -341,31 +438,6 @@ impl DesktopState {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub fn recent_integration_events(
     state: &DesktopState,
     limit: u16,
@@ -386,16 +458,9 @@ pub fn recent_integration_events(
         .collect())
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // Service profile commands
 // ---------------------------------------------------------------------------
-
-
-
-
 
 pub fn service_profile_to_dto(record: &ServiceProfileRecord) -> Result<ServiceProfileDto, String> {
     let languages: Vec<String> = serde_json::from_str(&record.languages_json)
@@ -415,48 +480,21 @@ pub fn service_profile_to_dto(record: &ServiceProfileRecord) -> Result<ServicePr
 // OBS adapter commands
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // ProPresenter adapter commands
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Bitfocus Companion adapter commands
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // OSC adapter commands
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // EasyWorship adapter commands
 // ---------------------------------------------------------------------------
-
-
-
-
-
 
 fn load_vmix_config(store: &AletheiaStore) -> Result<VmixConfig, String> {
     if let Some(record) = store
@@ -543,7 +581,11 @@ pub fn vmix_status_dto(adapter: &VmixAdapter) -> VmixStatusDto {
         allow_private_network: config.allow_private_network,
         checked_at_ms: now_ms(),
         username: config.username.clone().unwrap_or_default(),
-        auth_enabled: config.username.as_deref().map(|u| !u.is_empty()).unwrap_or(false),
+        auth_enabled: config
+            .username
+            .as_deref()
+            .map(|u| !u.is_empty())
+            .unwrap_or(false),
     }
 }
 
@@ -558,7 +600,6 @@ pub fn output_health_to_state_detail(health: OutputHealth) -> (String, String) {
         OutputHealth::Offline(detail) => ("offline".to_string(), detail),
     }
 }
-
 
 /// Append an audit event using an already-acquired store handle.
 ///
@@ -714,6 +755,14 @@ fn escape_html(input: &str) -> String {
 }
 
 fn seed_scripture_library(store: &AletheiaStore) -> Result<(), String> {
+    // Fast-path: if a real KJV import has already happened (≥ 1000 verses, well
+    // above the curated fixture set of ~150), skip the entire seeding pass.
+    // This avoids the ~10 s synchronous DB-write hang that was making Windows
+    // flag the desktop shell "Not Responding" on every launch.
+    if store.count_verses_for_translation("kjv").unwrap_or(0) >= 1000 {
+        return Ok(());
+    }
+
     store
         .insert_translation(&TranslationRecord {
             id: "kjv".to_string(),
@@ -968,7 +1017,9 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
                 name: name.to_string(),
                 language: "English".to_string(),
                 license: license.to_string(),
-                offline_ready: true,
+                // These rows are only curated compatibility samples. Full
+                // imports are marked ready by `import_full_bible_from_json`.
+                offline_ready: false,
             })
             .map_err(|error| error.to_string())?;
     }
@@ -1390,15 +1441,26 @@ fn canonical_book_name(abbrev: &str) -> String {
 /// Looks for bundled full-Bible JSON files in the Tauri resources folder and
 /// imports any translation whose verse count is below the full-canon threshold
 /// (~31 000). Run on a background thread so cold start doesn't block the UI.
-pub fn import_bundled_bibles(store: &AletheiaStore, resources_dir: &Path) {
+pub fn import_bundled_bibles(store: &AletheiaStore, resources_dir: &Path, db_path: &Path) {
     const FULL_BIBLE_VERSE_THRESHOLD: i64 = 30_000;
     let bundles: &[(&str, &str, &str, &str)] = &[
-        ("kjv", "King James Version", "public-domain", "kjv-full.json"),
+        (
+            "kjv",
+            "King James Version",
+            "public-domain",
+            "kjv-full.json",
+        ),
         (
             "bbe",
             "Bible in Basic English",
             "public-domain",
             "bbe-full.json",
+        ),
+        (
+            "web",
+            "World English Bible",
+            "public-domain",
+            "web-full.json",
         ),
     ];
     for (id, name, license, filename) in bundles {
@@ -1406,16 +1468,49 @@ pub fn import_bundled_bibles(store: &AletheiaStore, resources_dir: &Path) {
         if count >= FULL_BIBLE_VERSE_THRESHOLD {
             continue;
         }
-        let path = resources_dir.join("bibles").join(filename);
-        if !path.exists() {
-            log::warn!(
-                "[bible-import] bundled file missing: {} (verse count was {count})",
-                path.display()
-            );
-            continue;
-        }
+        // Probe a list of plausible locations. In a release bundle the resource
+        // dir resolves correctly; in `tauri dev` builds Tauri's resource_dir
+        // is the binary's parent (cargo target/debug), which usually does NOT
+        // contain the bundled bibles. Falling back to the workspace source
+        // tree lets dev launches actually populate the database.
+        let candidates: [std::path::PathBuf; 4] = [
+            resources_dir.join("bibles").join(filename),
+            resources_dir
+                .join("resources")
+                .join("bibles")
+                .join(filename),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("bibles")
+                .join(filename),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default()
+                .join("src-tauri")
+                .join("resources")
+                .join("bibles")
+                .join(filename),
+        ];
+        let path = match candidates.iter().find(|p| p.exists()) {
+            Some(p) => p.clone(),
+            None => {
+                log::warn!(
+                    "[bible-import] bundled file missing for {id}: tried {:?} (verse count was {count})",
+                    candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                );
+                continue;
+            }
+        };
         match import_full_bible_from_json(store, id, name, license, &path) {
-            Ok(n) => log::info!("[bible-import] {id}: {n} verses imported"),
+            Ok(n) => {
+                crate::scripture_search::invalidate_translation_cache(id);
+                crate::scripture_search::warm_translation_with_path(db_path, id);
+                log::info!("[bible-import] {id}: {n} verses imported");
+            }
             Err(error) => log::error!("[bible-import] {id} failed: {error}"),
         }
     }
@@ -1442,8 +1537,15 @@ fn seed_offline_assets(store: &AletheiaStore) -> Result<(), String> {
 /// Format: `"service-YYYY-MM-DD"` — matches the pattern used in `get_service_state`.
 fn current_service_session_id() -> String {
     use aletheia_core::now_ms;
-    let total_days = now_ms() / 1_000 / 86_400;
-    let z = total_days as u32 + 719_468;
+    format!("service-{}", utc_date_string(now_ms()))
+}
+
+/// Days-since-epoch → `YYYY-MM-DD` (UTC) without pulling in chrono.
+/// Used wherever we need a stable session-day key derived from a unix
+/// timestamp (live detection, service-state snapshot, audit attribution).
+pub fn utc_date_string(unix_ms: u64) -> String {
+    let total_days = (unix_ms / 1_000 / 86_400) as u32;
+    let z = total_days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
@@ -1453,7 +1555,7 @@ fn current_service_session_id() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("service-{y:04}-{m:02}-{d:02}")
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 pub fn scene_from_candidate(candidate: &ScriptureCandidateDto) -> Result<OutputScene, String> {
@@ -1468,7 +1570,6 @@ pub fn scene_from_candidate(candidate: &ScriptureCandidateDto) -> Result<OutputS
         "broadcast-lower",
     ))
 }
-
 
 #[cfg(test)]
 fn detect_production_transcript_candidates() -> Result<Vec<ScriptureCandidateDto>, String> {
@@ -1632,7 +1733,9 @@ fn accuracy_validation_fixtures() -> Vec<AccuracyFixture> {
     ]
 }
 
-pub fn merged_offline_asset_manifest(store: &AletheiaStore) -> Result<OfflineAssetManifest, String> {
+pub fn merged_offline_asset_manifest(
+    store: &AletheiaStore,
+) -> Result<OfflineAssetManifest, String> {
     let mut manifest = production_offline_asset_manifest();
     let states = store
         .list_offline_asset_states()
@@ -1858,12 +1961,14 @@ pub fn sha256_hex(input: &str) -> String {
 }
 
 pub fn verse_to_search_result(record: VerseRecord, source: &str) -> SearchResultDto {
+    let verse_id = format!("{}|{}|{}", record.book, record.chapter, record.verse);
     SearchResultDto {
         reference: format!("{} {}:{}", record.book, record.chapter, record.verse),
         translation: record.translation_id.to_uppercase(),
         snippet: record.text,
         source: source.to_string(),
         language: "English".to_string(),
+        verse_id,
     }
 }
 
@@ -1959,7 +2064,9 @@ fn canonical_book(input: &str) -> Option<&'static str> {
         "phil" | "php" | "philippians" => Some("Philippians"),
         "col" | "colossians" => Some("Colossians"),
         "1 thess" | "1thess" | "1 thessalonians" | "first thessalonians" => Some("1 Thessalonians"),
-        "2 thess" | "2thess" | "2 thessalonians" | "second thessalonians" => Some("2 Thessalonians"),
+        "2 thess" | "2thess" | "2 thessalonians" | "second thessalonians" => {
+            Some("2 Thessalonians")
+        }
         "1 tim" | "1tim" | "1 timothy" | "first timothy" => Some("1 Timothy"),
         "2 tim" | "2tim" | "2 timothy" | "second timothy" => Some("2 Timothy"),
         "titus" | "tit" => Some("Titus"),
@@ -1985,6 +2092,7 @@ pub fn default_search_results() -> Vec<SearchResultDto> {
             snippet: "For God so loved the world, that he gave his only begotten Son.".to_string(),
             source: "Exact reference".to_string(),
             language: "English".to_string(),
+            verse_id: "John|3|16".to_string(),
         },
         SearchResultDto {
             reference: "Psalm 23:1".to_string(),
@@ -1992,6 +2100,7 @@ pub fn default_search_results() -> Vec<SearchResultDto> {
             snippet: "The LORD is my shepherd; I shall not want.".to_string(),
             source: "Recent service plan".to_string(),
             language: "English".to_string(),
+            verse_id: "Psalm|23|1".to_string(),
         },
         SearchResultDto {
             reference: "1 Samuel 17:45".to_string(),
@@ -2000,6 +2109,7 @@ pub fn default_search_results() -> Vec<SearchResultDto> {
                 .to_string(),
             source: "Offline phrase match".to_string(),
             language: "English".to_string(),
+            verse_id: "1 Samuel|17|45".to_string(),
         },
     ]
 }
@@ -2239,7 +2349,6 @@ pub fn live_integrations(state: &DesktopState) -> Vec<IntegrationDto> {
 /// in place of the static demo fixture so the operator dashboard reflects the
 /// machine they are actually about to lead a service from.
 
-
 // ---------------------------------------------------------------------------
 // Trusted plugin registry commands (v6)
 // ---------------------------------------------------------------------------
@@ -2288,8 +2397,8 @@ pub fn trusted_plugin_record_to_dto(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aletheia_core::AuditAction;
     use crate::audit::record_audit;
+    use aletheia_core::AuditAction;
 
     #[test]
     fn production_detection_finds_high_confidence_romans_candidate() {
@@ -2402,14 +2511,12 @@ fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
         return;
     }
 
-    const CHECKSUM_EN: &str =
-        "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
-    const CHECKSUM_MULTI: &str =
-        "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe";
+    const CHECKSUM_EN: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+    const CHECKSUM_MULTI: &str = "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe";
 
     let packs: &[(&str, &str, &str)] = &[
-        ("stt-whisper-en-small",     "ggml-base.en.bin", CHECKSUM_EN),
-        ("stt-whisper-multilingual", "ggml-base.bin",    CHECKSUM_MULTI),
+        ("stt-whisper-en-small", "ggml-base.en.bin", CHECKSUM_EN),
+        ("stt-whisper-multilingual", "ggml-base.bin", CHECKSUM_MULTI),
     ];
 
     // Collect already-installed asset IDs to avoid redundant copies.
@@ -2511,7 +2618,10 @@ pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    Err("No offline STT model installed. Install model packs via Health → Offline Model Packs.".to_string())
+    Err(
+        "No offline STT model installed. Install model packs via Health → Offline Model Packs."
+            .to_string(),
+    )
 }
 
 // `OnceLock` cell for the installer's bundled-resource directory. Populated
@@ -2527,10 +2637,6 @@ pub fn set_bundled_resource_dir(path: PathBuf) {
 pub fn bundled_resource_dir() -> Option<&'static Path> {
     BUNDLED_RESOURCE_DIR.get().map(|p| p.as_path())
 }
-
-
-
-
 
 // ---------------------------------------------------------------------------
 
@@ -2614,7 +2720,10 @@ pub fn run() {
                             let state = probe_handle.state::<DesktopState>();
                             let adapter = state.lock_vmix().ok()?;
                             Some(aletheia_output::OutputAdapter::status(&*adapter).health)
-                        }).await.ok().flatten();
+                        })
+                        .await
+                        .ok()
+                        .flatten();
                         let (state_str, _detail) = match result {
                             Some(h) => crate::output_health_to_state_detail(h),
                             None => ("offline".to_string(), "vMix probe unavailable".to_string()),
@@ -2635,7 +2744,11 @@ pub fn run() {
                                 "attempt": attempt,
                                 "nextRetryMs": delay_ms,
                             });
-                            let _ = tauri::Emitter::emit(&app_handle, "aletheia://vmix-reconnect", payload);
+                            let _ = tauri::Emitter::emit(
+                                &app_handle,
+                                "aletheia://vmix-reconnect",
+                                payload,
+                            );
                             last_state = state_str;
                         }
                     }
@@ -2648,7 +2761,7 @@ pub fn run() {
             if let Ok(resource_dir) = app.path().resource_dir() {
                 let db_for_bibles = database_path.clone();
                 std::thread::spawn(move || match AletheiaStore::open_file(&db_for_bibles) {
-                    Ok(bg_store) => import_bundled_bibles(&bg_store, &resource_dir),
+                    Ok(bg_store) => import_bundled_bibles(&bg_store, &resource_dir, &db_for_bibles),
                     Err(e) => log::warn!("[bible-import] bg store open failed: {e}"),
                 });
             }
@@ -2670,10 +2783,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_service_state,
             search_scripture,
+            fetch_verse_in_translations,
             render_preview,
             set_destinations_armed,
             set_data_miser,
+            set_operating_mode,
+            get_translation_packs,
+            set_translation_packs,
+            recompute_calibration,
             send_live,
+            arm_and_send_live,
+            clear_all_outputs,
             run_pre_service_check,
             analyze_transcript,
             get_vmix_status,
@@ -2732,11 +2852,25 @@ pub fn run() {
             revoke_trusted_plugin,
             record_calibration_sample,
             get_calibration_report,
+            get_stt_status,
+            get_stt_latency_profile,
+            reload_stt_model,
             start_audio_capture,
             stop_audio_capture,
             get_capture_status,
+            get_vector_kb_status,
+            classify_voice_command,
+            audit_bible_integrity,
+            diagnose_backend,
+            run_production_release_gate,
+            run_full_scripture_regression,
+            start_full_scripture_regression_job,
+            get_full_scripture_regression_job,
+            cancel_full_scripture_regression_job,
+            list_display_outputs,
             import_bible_translation,
             list_bible_translations,
+            get_bible_chapter,
             show_main_window,
             set_operator_name,
             get_operator_name,
@@ -2764,7 +2898,10 @@ pub fn run() {
             list_audio_devices,
             delete_bible_translation,
             export_operator_config,
-            import_operator_config
+            import_operator_config,
+            search_scripture_unified_cmd,
+            get_scripture_health,
+            run_scripture_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aletheia desktop shell");

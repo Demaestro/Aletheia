@@ -17,7 +17,7 @@
  * Usage:  npm run desktop:launch
  */
 
-import { spawn, execFileSync }       from "node:child_process";
+import { spawn, execFileSync, execSync } from "node:child_process";
 import { resolve, dirname }          from "node:path";
 import { fileURLToPath }             from "node:url";
 import { existsSync, statSync, readdirSync } from "node:fs";
@@ -26,6 +26,24 @@ const __dir   = dirname(fileURLToPath(import.meta.url));
 const root    = resolve(__dir, "..");
 const BINARY  = "C:\\Users\\USER\\cargo-targets\\worship-production-interface\\debug\\aletheia-desktop.exe";
 const PORT    = "5178";
+
+// ── 0. Reclaim PORT — kill any zombie listener so the Tauri binary's hard-
+//      coded devUrl (http://127.0.0.1:5178) always matches the live server.
+//      A walked port (5179, 5180…) loads an empty page in WebView2 → no
+//      __TAURI_INTERNALS__ injection → frontend reports "Browser" mode and
+//      every native command call silently no-ops.
+try {
+  const out = execSync(`netstat -ano | findstr :${PORT}`, { encoding: "utf8" });
+  const pids = new Set();
+  for (const line of out.split(/\r?\n/)) {
+    const m = line.trim().match(/\s(\d+)$/);
+    if (m) pids.add(m[1]);
+  }
+  for (const pid of pids) {
+    try { execSync(`taskkill /F /PID ${pid}`, { stdio: "ignore" }); } catch {}
+  }
+  if (pids.size) process.stdout.write(`Freed port ${PORT} (killed ${[...pids].join(", ")}).\n`);
+} catch { /* netstat returned nothing — port already free */ }
 
 // ── 1. Staleness check ────────────────────────────────────────────────────
 function newestMtime(dir, exts) {

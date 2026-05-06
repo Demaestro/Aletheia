@@ -15,16 +15,32 @@ import {
 const DEFAULT_TIMEOUT_MS = 5_000;
 const SLOW_OP_TIMEOUT_MS = 15_000;
 
-function invokeWithTimeout<T>(cmd: string, args?: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+type InvokeTimeoutOptions = {
+  timeoutMs?: number;
+  cancelCommand?: string;
+  cancelArgs?: Record<string, unknown>;
+};
+
+function invokeWithTimeout<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+  timeoutOrOptions: number | InvokeTimeoutOptions = DEFAULT_TIMEOUT_MS
+): Promise<T> {
+  const options: InvokeTimeoutOptions =
+    typeof timeoutOrOptions === "number" ? { timeoutMs: timeoutOrOptions } : timeoutOrOptions;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   return Promise.race([
     invoke<T>(cmd, args),
     new Promise<never>((_, reject) => {
-      controller.signal.addEventListener("abort", () =>
-        reject(new Error(`Command "${cmd}" timed out after ${timeoutMs}ms`))
-      );
+      controller.signal.addEventListener("abort", () => {
+        if (options.cancelCommand) {
+          void invoke(options.cancelCommand, options.cancelArgs).catch(() => undefined);
+        }
+        reject(new Error(`Command "${cmd}" timed out after ${timeoutMs}ms`));
+      });
     })
   ]).finally(() => clearTimeout(timer));
 }
@@ -32,6 +48,7 @@ import type {
   AdapterDispatchResult,
   CalibrationReport,
   DesktopRuntimeStatus,
+  OperatingMode,
   AiDetectionResult,
   BoothPackExport,
   EasyWorshipConfig,
@@ -57,6 +74,8 @@ import type {
   VmixDispatchResult,
   VmixStatus
 } from "../types";
+import type { LiveScriptureCandidateDto } from "../gen/LiveScriptureCandidateDto";
+import type { SttLatencyProfileDto } from "../gen/SttLatencyProfileDto";
 
 type DesktopSession = {
   id: string;
@@ -67,6 +86,7 @@ type DesktopSession = {
   dataMiserEnabled: boolean;
   offlineModeEnabled: boolean;
   destinationsArmed: boolean;
+  operatingMode?: string;
   auditCount: number;
   lastEventSequence: number;
   checkedAtMs: number;
@@ -104,11 +124,19 @@ export type DesktopServiceState = {
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
   }
 }
 
 export function isTauriRuntime() {
-  return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
+  if (typeof window === "undefined") return false;
+  return Boolean(
+    window.__TAURI_INTERNALS__ ||
+    window.__TAURI__ ||
+    window.location.protocol === "tauri:" ||
+    window.location.hostname === "tauri.localhost" ||
+    navigator.userAgent.toLowerCase().includes("tauri")
+  );
 }
 
 /**
@@ -118,7 +146,6 @@ export function isTauriRuntime() {
  * React mounts — the window will appear only once the JS engine is live.
  */
 export async function showMainWindow(): Promise<void> {
-  if (!isTauriRuntime()) return;
   try {
     await invoke("show_main_window");
   } catch {
@@ -134,11 +161,14 @@ export async function showMainWindow(): Promise<void> {
  * Resolves with the path of the loaded STT model on success. Throws if no
  * offline model is installed or the microphone cannot be opened.
  */
-export async function startAudioCapture(languageHint?: string, deviceName?: string): Promise<string> {
-  if (!isTauriRuntime()) {
-    throw new Error("Live capture requires the desktop runtime.");
-  }
-  return invokeWithTimeout<string>("start_audio_capture", { languageHint, deviceName }, SLOW_OP_TIMEOUT_MS);
+export type CaptureMode = "command" | "transcript";
+
+export async function startAudioCapture(
+  languageHint?: string,
+  deviceName?: string,
+  mode: CaptureMode = "transcript"
+): Promise<string> {
+  return invokeWithTimeout<string>("start_audio_capture", { languageHint, deviceName, mode }, SLOW_OP_TIMEOUT_MS);
 }
 
 export type BibleTranslationStatus = {
@@ -148,6 +178,102 @@ export type BibleTranslationStatus = {
   fullCanon: boolean;
 };
 
+export type CommandIntent = {
+  intent: string;
+  reference: string | null;
+  book: string | null;
+  chapter: number | null;
+  verse: number | null;
+  translationId: string;
+  confidence: number;
+  needsDisambiguation: boolean;
+  disambiguationOptions: string[];
+  detail: string;
+};
+
+export type BibleIntegrityTranslation = BibleTranslationStatus & {
+  missingBooks: string[];
+  missingChapters: string[];
+  state: string;
+  detail: string;
+};
+
+export type VectorKbStatus = {
+  state: string;
+  detail: string;
+  manifestPath: string;
+  serviceUrl: string;
+  serviceOnline: boolean;
+  indexedTranslations: string[];
+  totalDocuments: number;
+  builtAtMs: number | null;
+};
+
+export type BackendDiagnostics = {
+  state: string;
+  checkedAtMs: number;
+  databasePath: string;
+  capture: CaptureStatus;
+  stt: SttStatus;
+  vector: VectorKbStatus;
+  bibles: BibleIntegrityTranslation[];
+  displays: DisplayOutput[];
+  issues: string[];
+};
+
+export type ReleaseGateCheck = {
+  id: string;
+  label: string;
+  state: string;
+  detail: string;
+  blocking: boolean;
+};
+
+export type ProductionReleaseGate = {
+  state: string;
+  checkedAtMs: number;
+  passed: number;
+  total: number;
+  checks: ReleaseGateCheck[];
+};
+
+export type ScriptureRegressionFailure = {
+  reference: string;
+  expectedBook: string;
+  expectedChapter: number;
+  expectedVerse: number;
+  actualReference: string | null;
+  detail: string;
+};
+
+export type ScriptureRegressionReport = {
+  translationId: string;
+  state: string;
+  checkedAtMs: number;
+  durationMs: number;
+  booksChecked: number;
+  chaptersChecked: number;
+  versesChecked: number;
+  directLookupChecked: number;
+  grammarChecked: number;
+  voiceCommandChecked: number;
+  searchPathChecked: number;
+  partialQuoteChecked: number;
+  passed: number;
+  failed: number;
+  firstFailures: ScriptureRegressionFailure[];
+};
+
+export type ScriptureRegressionJob = {
+  jobId: string;
+  state: string;
+  startedAtMs: number;
+  updatedAtMs: number;
+  cancelRequested: boolean;
+  report: ScriptureRegressionReport | null;
+  error: string | null;
+};
+
 export type BibleImportResult = {
   translationId: string;
   versesInserted: number;
@@ -155,13 +281,102 @@ export type BibleImportResult = {
 
 /** Lists all known translations and how many verses are currently loaded. */
 export async function listBibleTranslations(): Promise<BibleTranslationStatus[]> {
-  if (!isTauriRuntime()) return [];
+  // Static fallback so the dropdown is never empty even when Tauri IPC
+  // is missing or list_bible_translations fails. These three translations
+  // ship as bundled JSON under public/bibles/ and are guaranteed available
+  // via the getBibleChapter fallback path.
+  const bundledFallback: BibleTranslationStatus[] = [
+    { id: "kjv", name: "King James Version", versesLoaded: 31102, fullCanon: true },
+    { id: "web", name: "World English Bible", versesLoaded: 31102, fullCanon: true },
+    { id: "bbe", name: "Bible in Basic English", versesLoaded: 31086, fullCanon: true },
+  ];
+  if (!isTauriRuntime()) return bundledFallback;
   try {
-    return await invokeWithTimeout<BibleTranslationStatus[]>("list_bible_translations");
+    const native = await invokeWithTimeout<BibleTranslationStatus[]>("list_bible_translations");
+    if (native && native.length > 0) {
+      // Merge: prefer native counts but ensure bundled three always appear.
+      const merged = [...native];
+      for (const f of bundledFallback) {
+        if (!merged.some((t) => t.id.toLowerCase() === f.id)) merged.push(f);
+      }
+      return merged;
+    }
+    return bundledFallback;
   } catch (err) {
-    console.warn("list_bible_translations failed", err);
-    return [];
+    console.warn("list_bible_translations failed, using bundled fallback", err);
+    return bundledFallback;
   }
+}
+
+export async function classifyVoiceCommand(
+  text: string,
+  currentReference?: string,
+  translationId = "kjv"
+): Promise<CommandIntent> {
+  return invokeWithTimeout<CommandIntent>("classify_voice_command", {
+    text,
+    currentReference,
+    translationId,
+  });
+}
+
+export async function auditBibleIntegrity(): Promise<BibleIntegrityTranslation[]> {
+  return invokeWithTimeout<BibleIntegrityTranslation[]>("audit_bible_integrity", undefined, SLOW_OP_TIMEOUT_MS);
+}
+
+export async function getVectorKbStatus(): Promise<VectorKbStatus> {
+  return invokeWithTimeout<VectorKbStatus>("get_vector_kb_status");
+}
+
+export async function diagnoseBackend(): Promise<BackendDiagnostics> {
+  return invokeWithTimeout<BackendDiagnostics>("diagnose_backend", undefined, SLOW_OP_TIMEOUT_MS);
+}
+
+export async function runProductionReleaseGate(): Promise<ProductionReleaseGate> {
+  return invokeWithTimeout<ProductionReleaseGate>(
+    "run_production_release_gate",
+    undefined,
+    SLOW_OP_TIMEOUT_MS
+  );
+}
+
+export async function runFullScriptureRegression(
+  translationId = "kjv"
+): Promise<ScriptureRegressionReport> {
+  return invokeWithTimeout<ScriptureRegressionReport>(
+    "run_full_scripture_regression",
+    { translationId },
+    {
+      timeoutMs: 180_000,
+      cancelCommand: "cancel_full_scripture_regression_job",
+    }
+  );
+}
+
+export async function startFullScriptureRegressionJob(
+  translationId = "kjv"
+): Promise<ScriptureRegressionJob> {
+  return invokeWithTimeout<ScriptureRegressionJob>(
+    "start_full_scripture_regression_job",
+    { translationId },
+    DEFAULT_TIMEOUT_MS
+  );
+}
+
+export async function getFullScriptureRegressionJob(): Promise<ScriptureRegressionJob | null> {
+  return invokeWithTimeout<ScriptureRegressionJob | null>(
+    "get_full_scripture_regression_job",
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  );
+}
+
+export async function cancelFullScriptureRegressionJob(): Promise<boolean> {
+  return invokeWithTimeout<boolean>(
+    "cancel_full_scripture_regression_job",
+    undefined,
+    DEFAULT_TIMEOUT_MS
+  );
 }
 
 /**
@@ -221,7 +436,9 @@ export async function importOperatorConfig(json: string): Promise<void> {
  * Use this to populate an audio device picker dropdown.
  */
 export async function listAudioDevices(): Promise<string[]> {
-  if (!isTauriRuntime()) return ["Default Microphone (Browser Fallback)"];
+  if (!isTauriRuntime()) {
+    return ["Default Microphone (Browser Fallback)"];
+  }
   try {
     return await invokeWithTimeout<string[]>("list_audio_devices");
   } catch {
@@ -432,10 +649,17 @@ export async function fetchVerseOnDemand(
 
 
 export async function getDesktopServiceState(): Promise<DesktopServiceState> {
-  if (!isTauriRuntime()) return fallbackServiceState();
-
+  // The first call after launch races the bundled-bible import thread, which
+  // holds a write lock on SQLite for ~10-15s while inserting ~31k verses per
+  // translation. We use the longer slow-op budget so the UI doesn't latch into
+  // fallback mode (which flips the "Browser mode" banner) just because the
+  // boot write storm is in progress.
   try {
-    const state = await invokeWithTimeout<RawDesktopServiceState>("get_service_state");
+    const state = await invokeWithTimeout<RawDesktopServiceState>(
+      "get_service_state",
+      undefined,
+      SLOW_OP_TIMEOUT_MS
+    );
     return normalizeServiceState(state);
   } catch (error) {
     console.warn("Aletheia desktop state unavailable, using browser fallback", error);
@@ -443,11 +667,18 @@ export async function getDesktopServiceState(): Promise<DesktopServiceState> {
   }
 }
 
-export async function searchScripture(query: string): Promise<ManualSearchResult[]> {
+export async function searchScripture(
+  query: string,
+  translationId = "kjv"
+): Promise<ManualSearchResult[]> {
   if (!isTauriRuntime()) return fallbackSearch(query);
 
   try {
-    return await invokeWithTimeout<ManualSearchResult[]>("search_scripture", { query });
+    return await invokeWithTimeout<ManualSearchResult[]>("search_scripture_unified_cmd", {
+      query,
+      translationId,
+      context: "manualSearch",
+    });
   } catch (error) {
     console.warn("Aletheia local scripture search failed, using browser fallback", error);
     return fallbackSearch(query);
@@ -479,9 +710,26 @@ export async function setDataMiser(enabled: boolean): Promise<DesktopRuntimeStat
   return normalizeSession(updated.session);
 }
 
-export async function sendLiveCandidate(candidate: ScriptureCandidate, destinationsArmed: boolean): Promise<LiveOutputResult> {
-  if (!destinationsArmed) throw new Error("Live output is blocked until destinations are armed.");
+export async function setOperatingMode(mode: OperatingMode): Promise<DesktopRuntimeStatus> {
+  if (!isTauriRuntime()) {
+    return { ...fallbackRuntimeStatus(), operatingMode: mode, checkedAtMs: Date.now() };
+  }
+  await invokeWithTimeout<void>("set_operating_mode", { mode });
+  const updated = await invokeWithTimeout<RawDesktopServiceState>("get_service_state");
+  return normalizeSession(updated.session);
+}
 
+export async function getTranslationPacks(): Promise<string[]> {
+  if (!isTauriRuntime()) return ["kjv"];
+  return invokeWithTimeout<string[]>("get_translation_packs");
+}
+
+export async function setTranslationPacks(packs: string[]): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invokeWithTimeout<void>("set_translation_packs", { packs });
+}
+
+export async function sendLiveCandidate(candidate: ScriptureCandidate): Promise<LiveOutputResult> {
   if (!isTauriRuntime()) {
     return {
       scene: fallbackScene(candidate),
@@ -489,7 +737,20 @@ export async function sendLiveCandidate(candidate: ScriptureCandidate, destinati
     };
   }
 
-  return invokeWithTimeout<LiveOutputResult>("send_live", { candidate, destinationsArmed });
+  return invokeWithTimeout<LiveOutputResult>("send_live", { candidate });
+}
+
+export async function armAndSendLiveCandidate(candidate: ScriptureCandidate): Promise<LiveOutputResult> {
+  if (!isTauriRuntime()) {
+    return {
+      scene: fallbackScene(candidate),
+      auditCount: fallbackRuntimeStatus().auditCount + 1
+    };
+  }
+  return invokeWithTimeout<LiveOutputResult>("arm_and_send_live", {
+    candidate,
+    operatorActionId: `operator-send-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+  });
 }
 
 export async function runPreServiceCheck(): Promise<HealthItem[]> {
@@ -1217,6 +1478,21 @@ export async function onCandidatesUpdated(
   );
 }
 
+/**
+ * Subscribe to single-scripture-candidate events from the live detection
+ * pipeline. Each payload is one DTO ready to display as preview.
+ */
+export async function onScriptureCandidate(
+  callback: (payload: LiveScriptureCandidateDto) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<LiveScriptureCandidateDto>(
+    "aletheia://scripture-candidate",
+    (event) => callback(event.payload)
+  );
+}
+
 type RawDesktopServiceState = {
   session: DesktopSession;
   transcript: TranscriptSegment[];
@@ -1242,10 +1518,22 @@ function normalizeSession(session: DesktopSession): DesktopRuntimeStatus {
     dataMiserEnabled: session.dataMiserEnabled,
     offlineModeEnabled: session.offlineModeEnabled,
     destinationsArmed: session.destinationsArmed,
+    operatingMode: normalizeOperatingMode(session.operatingMode),
     auditCount: session.auditCount,
     lastEventSequence: session.lastEventSequence,
     checkedAtMs: session.checkedAtMs
   };
+}
+
+function normalizeOperatingMode(raw: string | undefined): OperatingMode {
+  switch ((raw ?? "").toLowerCase()) {
+    case "manual": return "manual";
+    case "auto": return "auto";
+    case "rehearsal": return "rehearsal";
+    case "mock": return "mock";
+    case "assisted":
+    default: return "assisted";
+  }
 }
 
 function fallbackServiceState(): DesktopServiceState {
@@ -1261,13 +1549,17 @@ function fallbackServiceState(): DesktopServiceState {
 }
 
 function fallbackRuntimeStatus(): DesktopRuntimeStatus {
+  // Safe defaults: never silently arm destinations or enable data-miser.
+  // The backend is the source of truth — fallback only fires during boot
+  // timeouts or in pure browser-preview mode.
   return {
     mode: "browser-fallback",
-    serviceSession: "Browser demo service",
-    databasePath: "Demo data in memory",
-    dataMiserEnabled: true,
-    offlineModeEnabled: true,
-    destinationsArmed: true,
+    serviceSession: "Initialising core…",
+    databasePath: "",
+    dataMiserEnabled: false,
+    offlineModeEnabled: false,
+    destinationsArmed: false,
+    operatingMode: "assisted",
     auditCount: 0,
     lastEventSequence: 0,
     checkedAtMs: Date.now()
@@ -1914,6 +2206,300 @@ export async function updateStreamOverlayState(
 
 export async function getStreamOverlayServerStatus(): Promise<StreamOverlayServerStatus> {
   return invokeWithTimeout<StreamOverlayServerStatus>("get_stream_overlay_server_status");
+}
+
+/**
+ * Browser-fallback transcript export. The Rust shell has no `save_transcript_export`
+ * command yet, so this writes the file via the browser download flow when running
+ * in Tauri WebView. Returns the suggested file path. Never throws — best-effort.
+ */
+export async function saveTranscriptExport(
+  selectedPath: string,
+  content: string
+): Promise<string> {
+  try {
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = selectedPath?.split(/[\\/]/).pop() || "transcript.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    console.warn("saveTranscriptExport download fallback failed", err);
+  }
+  return selectedPath || "transcript.txt";
+}
+
+// ---------------------------------------------------------------------------
+// Stubs for symbols referenced by UI components but not yet wired through the
+// Rust shell. These return safe defaults / no-op subscriptions so the bundle
+// builds and the app launches even when the corresponding Tauri command is
+// missing. Real implementations should replace these as the Rust side lands.
+// ---------------------------------------------------------------------------
+
+export type AudioLevel = {
+  level: number;
+  peakLevel: number;
+  speechDetected: boolean;
+  checkedAtMs: number;
+  rms?: number;
+  peak?: number;
+};
+
+export type CaptureHealth = {
+  state: string;
+  detail: string;
+  deviceName: string | null;
+  checkedAtMs: number;
+};
+
+export type CaptureStatus = {
+  running: boolean;
+  modelPath: string | null;
+};
+
+export type BibleVerse = {
+  verse: number;
+  text: string;
+  reference: string;
+  translation: string;
+  book?: string;
+  chapter?: number;
+};
+
+export type SttLatencyProfile = SttLatencyProfileDto;
+
+export type SttStatus = {
+  modelLoaded: boolean;
+  modelFilename: string | null;
+  modelQuality: string | null;
+  modelSizeMb: number | null;
+  modelWarning: string | null;
+  modelPath: string | null;
+  assetRoot: string | null;
+  loadError: string | null;
+};
+
+export type DisplayOutput = {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  positionX: number;
+  positionY: number;
+  scaleFactor: number;
+  isPrimary: boolean;
+  likelyHdmi: boolean;
+  detail: string;
+};
+
+const EMPTY_STT_STATUS: SttStatus = {
+  modelLoaded: false,
+  modelFilename: null,
+  modelQuality: null,
+  modelSizeMb: null,
+  modelWarning: null,
+  modelPath: null,
+  assetRoot: null,
+  loadError: null,
+};
+
+const EMPTY_LATENCY_PROFILE: SttLatencyProfile = {
+  sampleCount: 0,
+  latestMs: null,
+  averageMs: null,
+  p50Ms: null,
+  p95Ms: null,
+  fastestMs: null,
+  slowestMs: null,
+  targetMs: 2000,
+  state: "pending",
+  detail: "No STT latency samples yet.",
+  checkedAtMs: BigInt(Date.now()),
+};
+
+async function tryInvoke<T>(cmd: string, args?: Record<string, unknown>, fallback?: T): Promise<T> {
+  try {
+    return await invokeWithTimeout<T>(cmd, args);
+  } catch {
+    return fallback as T;
+  }
+}
+
+export async function getBibleChapter(
+  translationId: string,
+  book: string,
+  chapter: number
+): Promise<BibleVerse[]> {
+  // Try the native Tauri command first when the runtime is present. If the
+  // Tauri IPC bridge failed to inject (port mismatch, dev-server race, etc.)
+  // we'd otherwise blank the reader, so we always retry-via-fetch as a
+  // best-effort. Any error the user can act on (missing translation, etc.)
+  // is allowed to propagate from invokeWithTimeout.
+  if (isTauriRuntime()) {
+    try {
+      return await invokeWithTimeout<BibleVerse[]>("get_bible_chapter", {
+        translationId,
+        book,
+        chapter,
+      });
+    } catch (err) {
+      console.warn("get_bible_chapter native failed, falling back to dist asset", err);
+    }
+  }
+  // Fallback: load the bundled JSON shipped under /public/bibles/.
+  // The shipped format is the "scrollmapper" shape:
+  //   [{ abbrev, name, chapters: [["v1text", "v2text", ...], ...] }, ...]
+  // We accept that AND a flat [{book, chapter, verse, text}] shape as a
+  // safety-net for future translations.
+  const bookFolded = book.trim().toLowerCase();
+  const psalmAliases = ["psalm", "psalms"];
+  const songAliases = ["song of solomon", "song of songs", "canticles", "song"];
+  const matchesBook = (candidate: string): boolean => {
+    const cf = candidate.trim().toLowerCase();
+    if (cf === bookFolded) return true;
+    if (psalmAliases.includes(cf) && psalmAliases.includes(bookFolded)) return true;
+    if (songAliases.includes(cf) && songAliases.includes(bookFolded)) return true;
+    return false;
+  };
+
+  // Try the requested translation first, then fall back across the bundled
+  // KJV/WEB/BBE so the reader never blanks just because a translation slot is
+  // empty in the local DB.
+  const translationOrder: string[] = [];
+  const pushT = (t: string) => {
+    const lc = t.toLowerCase();
+    if (lc && !translationOrder.includes(lc)) translationOrder.push(lc);
+  };
+  pushT(translationId);
+  pushT("kjv");
+  pushT("web");
+  pushT("bbe");
+
+  for (const tid of translationOrder) {
+    try {
+      const resp = await fetch(`bibles/${tid}-full.json`);
+      if (!resp.ok) continue;
+      const raw = await resp.json();
+
+      // Shape A: nested { abbrev, name, chapters: [[..verses..]] }
+      if (Array.isArray(raw) && raw.length > 0 && raw[0] && Array.isArray((raw[0] as { chapters?: unknown }).chapters)) {
+        const books = raw as Array<{ abbrev?: string; name?: string; chapters: string[][] }>;
+        const entry = books.find(
+          (b) => (b.name && matchesBook(b.name)) || (b.abbrev && matchesBook(b.abbrev))
+        );
+        if (!entry) continue;
+        const chapterIdx = chapter - 1;
+        if (chapterIdx < 0 || chapterIdx >= entry.chapters.length) continue;
+        const verses = entry.chapters[chapterIdx];
+        const displayBook = entry.name || book;
+        const out = verses.map((text, i) => ({
+          translation: tid.toUpperCase(),
+          book: displayBook,
+          chapter,
+          verse: i + 1,
+          text,
+          reference: `${displayBook} ${chapter}:${i + 1}`,
+        }));
+        if (out.length > 0) return out;
+      }
+
+      // Shape B: flat [{book, chapter, verse, text}]
+      if (Array.isArray(raw) && raw.length > 0 && (raw[0] as { verse?: unknown }).verse !== undefined) {
+        const data = raw as Array<{ book: string; chapter: number; verse: number; text: string }>;
+        const out = data
+          .filter((v) => matchesBook(v.book) && v.chapter === chapter)
+          .map((v) => ({
+            translation: tid.toUpperCase(),
+            book: v.book,
+            chapter: v.chapter,
+            verse: v.verse,
+            text: v.text,
+            reference: `${v.book} ${v.chapter}:${v.verse}`,
+          }));
+        if (out.length > 0) return out;
+      }
+    } catch (err) {
+      console.warn(`bible fallback fetch failed for ${tid}`, err);
+    }
+  }
+  return [];
+}
+
+export async function previewCandidate(candidateId: string): Promise<void> {
+  await tryInvoke<void>("preview_candidate", { candidateId }, undefined);
+}
+
+export async function approveCandidate(candidateId: string): Promise<void> {
+  await tryInvoke<void>("approve_candidate", { candidateId }, undefined);
+}
+
+export async function rejectCandidate(candidateId: string): Promise<void> {
+  await tryInvoke<void>("reject_candidate", { candidateId }, undefined);
+}
+
+export async function takeCandidateLive(candidateId: string): Promise<void> {
+  await tryInvoke<void>("take_candidate_live", { candidateId }, undefined);
+}
+
+export async function clearAllOutputs(source: string): Promise<string[]> {
+  return tryInvoke<string[]>("clear_all_outputs", { source }, []);
+}
+
+export async function getSttStatus(): Promise<SttStatus> {
+  return tryInvoke<SttStatus>("get_stt_status", undefined, EMPTY_STT_STATUS);
+}
+
+export async function getSttLatencyProfile(): Promise<SttLatencyProfile> {
+  return tryInvoke<SttLatencyProfile>(
+    "get_stt_latency_profile",
+    undefined,
+    EMPTY_LATENCY_PROFILE
+  );
+}
+
+export async function reloadSttModel(): Promise<SttStatus> {
+  try {
+    return await invokeWithTimeout<SttStatus>("reload_stt_model", undefined, 30_000);
+  } catch {
+    return EMPTY_STT_STATUS;
+  }
+}
+
+export async function listDisplayOutputs(): Promise<DisplayOutput[]> {
+  return tryInvoke<DisplayOutput[]>("list_display_outputs", undefined, []);
+}
+
+async function safeListen<T>(event: string, callback: (payload: T) => void): Promise<() => void> {
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<T>(event, (e) => callback(e.payload));
+  } catch {
+    return () => undefined;
+  }
+}
+
+export async function onAudioLevel(callback: (level: AudioLevel) => void): Promise<() => void> {
+  return safeListen<AudioLevel>("aletheia://audio-level", callback);
+}
+
+export async function onCaptureStarted(callback: (health: CaptureHealth) => void): Promise<() => void> {
+  return safeListen<CaptureHealth>("aletheia://capture-started", callback);
+}
+
+export async function onCaptureHealth(callback: (health: CaptureHealth) => void): Promise<() => void> {
+  return safeListen<CaptureHealth>("aletheia://capture-health", callback);
+}
+
+export async function onCaptureError(callback: (detail: string) => void): Promise<() => void> {
+  return safeListen<string>("aletheia://capture-error", callback);
+}
+
+export async function onCaptureStopped(callback: () => void): Promise<() => void> {
+  return safeListen<unknown>("aletheia://capture-stopped", () => callback());
 }
 
 function fallbackServiceProfile(

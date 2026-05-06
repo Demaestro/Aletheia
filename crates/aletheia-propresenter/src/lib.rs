@@ -138,7 +138,8 @@ impl ProPresenterAdapter {
         }
 
         // Body is JSON: { "name": "ProPresenter", "platform": "macOS", ... }
-        let name = extract_json_string(&response.body, "name").unwrap_or_else(|| "ProPresenter".to_string());
+        let name = extract_json_string(&response.body, "name")
+            .unwrap_or_else(|| "ProPresenter".to_string());
         let host_description = extract_json_string(&response.body, "host_description")
             .or_else(|| extract_json_string(&response.body, "platform"))
             .unwrap_or_else(|| "unknown".to_string());
@@ -166,7 +167,9 @@ impl ProPresenterAdapter {
                 "text": { "text": reference }
             }
         ]);
-        let body = serde_json::to_string(&payload).map_err(|e| ProPresenterError::InvalidConfig(format!("Failed to serialize message payload: {e}")))?;
+        let body = serde_json::to_string(&payload).map_err(|e| {
+            ProPresenterError::InvalidConfig(format!("Failed to serialize message payload: {e}"))
+        })?;
 
         let path = format!(
             "/v1/messages/{}",
@@ -176,7 +179,10 @@ impl ProPresenterAdapter {
         if !(200..300).contains(&response.status_code) {
             return Err(ProPresenterError::HttpStatus {
                 code: response.status_code,
-                detail: format!("ProPresenter rejected message update for {}", self.config.message_name),
+                detail: format!(
+                    "ProPresenter rejected message update for {}",
+                    self.config.message_name
+                ),
             });
         }
         Ok(())
@@ -487,7 +493,6 @@ fn hex_digit(value: u8) -> char {
     }
 }
 
-
 /// Tiny JSON helper: pull a top-level string field by key. Avoids dragging in a
 /// JSON parser for the one thing /version returns.
 fn extract_json_string(body: &str, key: &str) -> Option<String> {
@@ -533,7 +538,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn url_encode_keeps_unreserved_and_percent_encodes_spaces() {
         assert_eq!(url_encode_path_segment("Scripture"), "Scripture");
@@ -542,8 +546,7 @@ mod tests {
 
     #[test]
     fn extract_json_string_pulls_top_level_field() {
-        let body =
-            r#"{"name":"ProPresenter","host_description":"Mac mini","platform":"macOS"}"#;
+        let body = r#"{"name":"ProPresenter","host_description":"Mac mini","platform":"macOS"}"#;
         assert_eq!(
             extract_json_string(body, "name"),
             Some("ProPresenter".to_string())

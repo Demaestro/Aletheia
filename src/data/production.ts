@@ -1,6 +1,7 @@
 import {
   Activity,
   AudioLines,
+  BookText,
   Cable,
   CheckCircle2,
   Film,
@@ -38,6 +39,7 @@ export const navItems: NavItem[] = [
   { key: "transcript",    label: "Transcript",   eyebrow: "Listen",   icon: Subtitles },
   { key: "queue",         label: "Scripture",    eyebrow: "Approve",  icon: CheckCircle2 },
   { key: "output",        label: "Output",       eyebrow: "Present",  icon: MonitorUp },
+  { key: "bible",         label: "Bible",        eyebrow: "Read",     icon: BookText },
   { key: "songs",         label: "Songs",        eyebrow: "Lyrics",   icon: Music },
   { key: "stream",        label: "Stream",       eyebrow: "Overlay",  icon: Tv },
   { key: "integrations",  label: "Integrations", eyebrow: "Connect",  icon: Cable },
@@ -285,8 +287,8 @@ export const healthItems: HealthItem[] = [
   },
   {
     label: "STT language packs",
-    state: "degraded",
-    detail: "English offline ready. African language, Spanish, and French packs are queued for operator-approved install.",
+    state: "healthy",
+    detail: "English offline ready. Additional languages available on demand.",
     action: "Download pack"
   },
   {
@@ -386,6 +388,7 @@ export const screenOrder: ScreenKey[] = [
   "transcript",
   "queue",
   "output",
+  "bible",
   "theme",
   "integrations",
   "health",

@@ -4,7 +4,7 @@ use aletheia_core::{AuditAction, EventEnvelope, TimestampMs};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// SQLite-backed local store.
 pub struct AletheiaStore {
@@ -34,8 +34,12 @@ impl AletheiaStore {
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous   = NORMAL;
-             PRAGMA foreign_keys  = ON;",
+             PRAGMA foreign_keys  = ON;
+             PRAGMA busy_timeout  = 30000;",
         )?;
+        // Extra safety: make sure any contending writer waits up to 30s
+        // instead of failing immediately with SQLITE_BUSY ("database is locked").
+        connection.busy_timeout(std::time::Duration::from_secs(30))?;
         let store = Self { connection };
         store.migrate()?;
         let on_disk = store.schema_version()?;
@@ -46,6 +50,39 @@ impl AletheiaStore {
             });
         }
         Ok(store)
+    }
+
+    /// Opens a fresh, isolated read-only `Connection` against the same
+    /// database file. WAL mode lets readers operate concurrently with the
+    /// writer (and with each other) without contending on a single
+    /// `Mutex<AletheiaStore>`. Returns `query_only = ON` so any accidental
+    /// write attempts fail loudly instead of blocking on the writer.
+    ///
+    /// Use for hot read-heavy paths (semantic warm-up scan, dashboard
+    /// fan-out queries) so they don't serialize with audit writes or
+    /// operator-driven mutations.
+    pub fn open_read_only(path: impl AsRef<std::path::Path>) -> StoreResult<Connection> {
+        use rusqlite::OpenFlags;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA query_only   = ON;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(connection)
+    }
+
+    /// Wraps a pre-opened read-only [`Connection`] in an `AletheiaStore` so
+    /// existing read-side methods (`find_verse`, `search_phrase`, …) can be
+    /// reused without locking the writer's `Mutex<AletheiaStore>`. Skips
+    /// migration: the connection is `query_only`, and any write attempt fails
+    /// loudly at the SQLite layer.
+    pub fn from_read_only_connection(connection: Connection) -> Self {
+        Self { connection }
     }
 
     /// Applies idempotent migrations.
@@ -172,7 +209,20 @@ impl AletheiaStore {
 
     /// Runs local phrase search using SQLite FTS5.
     pub fn search_phrase(&self, phrase: &str, limit: u16) -> StoreResult<Vec<VerseRecord>> {
-        let mut statement = self.connection.prepare(
+        Self::search_phrase_on(&self.connection, phrase, limit)
+    }
+
+    /// Same as [`AletheiaStore::search_phrase`] but operates on any
+    /// caller-provided `Connection`. Hot read paths (semantic warm-up,
+    /// dashboard fan-out) can pass a dedicated read-only connection from
+    /// [`AletheiaStore::open_read_only`] so they don't contend with the
+    /// writer-backed `AletheiaStore` mutex.
+    pub fn search_phrase_on(
+        connection: &Connection,
+        phrase: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<VerseRecord>> {
+        let mut statement = connection.prepare(
             "SELECT translation_id, book, chapter, verse, text
              FROM scripture_verses_fts
              WHERE scripture_verses_fts MATCH ?1
@@ -180,6 +230,98 @@ impl AletheiaStore {
              LIMIT ?2",
         )?;
         let rows = statement.query_map(params![phrase, limit], VerseRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Single-verse lookup against any caller-provided `Connection`. Mirror
+    /// of [`AletheiaStore::find_verse`] for read-only secondary connections.
+    pub fn find_verse_on(
+        connection: &Connection,
+        translation_id: &str,
+        book: &str,
+        chapter: u16,
+        verse: u16,
+    ) -> StoreResult<Option<VerseRecord>> {
+        connection
+            .query_row(
+                "SELECT translation_id, book, chapter, verse, text
+                 FROM scripture_verses
+                 WHERE translation_id = ?1 AND book = ?2 AND chapter = ?3 AND verse = ?4",
+                params![translation_id, book, chapter, verse],
+                VerseRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Returns a small candidate pool using case-insensitive keyword scans.
+    ///
+    /// This is a fallback for live speech where STT may provide only a
+    /// midpoint/end-of-verse fragment and the stricter FTS query has no hit.
+    /// The caller must score and rank the records before using them.
+    pub fn search_keyword_candidates(
+        &self,
+        translation_id: &str,
+        terms: &[String],
+        limit: u16,
+    ) -> StoreResult<Vec<VerseRecord>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::<(String, String, u16, u16)>::new();
+        let mut ordered_terms = terms
+            .iter()
+            .filter(|term| term.len() >= 3)
+            .cloned()
+            .collect::<Vec<_>>();
+        ordered_terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+
+        let per_term_limit = i64::from(limit).max(16);
+        for term in ordered_terms {
+            let like = format!("%{}%", term.replace(['%', '_'], ""));
+            let mut statement = self.connection.prepare(
+                "SELECT translation_id, book, chapter, verse, text
+                 FROM scripture_verses
+                 WHERE translation_id = ?1 AND lower(text) LIKE lower(?2)
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![translation_id, like, per_term_limit],
+                VerseRecord::from_row,
+            )?;
+            for row in rows {
+                let record = row?;
+                let key = (
+                    record.translation_id.clone(),
+                    record.book.clone(),
+                    record.chapter,
+                    record.verse,
+                );
+                if seen.insert(key) {
+                    out.push(record);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Returns every verse in a chapter in canonical verse order.
+    pub fn chapter_verses(
+        &self,
+        translation_id: &str,
+        book: &str,
+        chapter: u16,
+    ) -> StoreResult<Vec<VerseRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT translation_id, book, chapter, verse, text
+             FROM scripture_verses
+             WHERE translation_id = ?1 AND book = ?2 AND chapter = ?3
+             ORDER BY verse ASC",
+        )?;
+        let rows = statement.query_map(
+            params![translation_id, book, chapter],
+            VerseRecord::from_row,
+        )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -537,6 +679,77 @@ impl AletheiaStore {
             .map_err(StoreError::from)
     }
 
+    /// Upserts one operator-confirmed phrase-to-reference memory.
+    ///
+    /// This is intentionally fed only by approved operator actions, not by
+    /// raw low-confidence detector guesses. It lets the local detector improve
+    /// for a church's phrasing without creating an unsafe self-training loop.
+    pub fn upsert_learned_scripture_phrase(
+        &self,
+        phrase: &str,
+        reference: &str,
+        translation_id: &str,
+        language: &str,
+        source: &str,
+        learned_at_ms: TimestampMs,
+    ) -> StoreResult<()> {
+        let phrase = phrase.trim();
+        if phrase.len() < 8 || reference.trim().is_empty() {
+            return Ok(());
+        }
+
+        let phrase_key = normalized_phrase_key(phrase);
+        if phrase_key.len() < 8 {
+            return Ok(());
+        }
+
+        self.connection.execute(
+            "INSERT INTO learned_scripture_phrases
+               (phrase_key, phrase, reference, translation_id, language, source,
+                confidence, use_count, learned_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, 1, ?7, ?7)
+             ON CONFLICT(phrase_key, reference, translation_id) DO UPDATE SET
+               phrase = excluded.phrase,
+               language = excluded.language,
+               source = excluded.source,
+               confidence = min(1.0, learned_scripture_phrases.confidence + 0.05),
+               use_count = learned_scripture_phrases.use_count + 1,
+               updated_at_ms = excluded.updated_at_ms",
+            params![
+                phrase_key,
+                phrase,
+                reference.trim(),
+                translation_id.trim().to_lowercase(),
+                language.trim(),
+                source.trim(),
+                learned_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns recent learned phrase memories for local adaptive detection.
+    pub fn list_learned_scripture_phrases(
+        &self,
+        translation_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<LearnedScripturePhraseRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, phrase_key, phrase, reference, translation_id, language, source,
+                    confidence, use_count, learned_at_ms, updated_at_ms
+             FROM learned_scripture_phrases
+             WHERE translation_id = ?1
+             ORDER BY use_count DESC, updated_at_ms DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![translation_id.trim().to_lowercase(), limit],
+            LearnedScripturePhraseRecord::from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// Returns aggregate accuracy metrics from stored calibration samples.
     /// Returns `(confirmed, corrected, rejected, total)`.
     pub fn calibration_summary(&self) -> StoreResult<(i64, i64, i64, i64)> {
@@ -579,11 +792,315 @@ impl AletheiaStore {
     /// Loads the persisted runtime state JSON, if any. Returns `None` on
     /// a fresh install or after a schema reset.
     pub fn load_runtime_state(&self) -> StoreResult<Option<String>> {
-        Ok(self.connection.query_row(
-            "SELECT state_json FROM runtime_state WHERE id = 1",
-            [],
-            |row| row.get(0),
-        ).optional()?)
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT state_json FROM runtime_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Service sessions (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Creates or updates a service session row. Idempotent on `id`.
+    pub fn upsert_service_session(&self, session: &ServiceSessionRecord) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO service_sessions
+               (id, name, started_at_ms, ended_at_ms, data_miser_enabled, offline_mode_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               started_at_ms = excluded.started_at_ms,
+               ended_at_ms = excluded.ended_at_ms,
+               data_miser_enabled = excluded.data_miser_enabled,
+               offline_mode_enabled = excluded.offline_mode_enabled",
+            params![
+                session.id,
+                session.name,
+                session.started_at_ms,
+                session.ended_at_ms,
+                session.data_miser_enabled as i64,
+                session.offline_mode_enabled as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a session as ended.
+    pub fn end_service_session(&self, id: &str, ended_at_ms: TimestampMs) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE service_sessions SET ended_at_ms = ?1 WHERE id = ?2",
+            params![ended_at_ms, id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns a single service session by id.
+    pub fn get_service_session(&self, id: &str) -> StoreResult<Option<ServiceSessionRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, name, started_at_ms, ended_at_ms, data_miser_enabled, offline_mode_enabled
+                 FROM service_sessions WHERE id = ?1",
+                params![id],
+                ServiceSessionRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Transcript segments (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Inserts one transcript segment row.
+    pub fn insert_transcript_segment(&self, segment: &TranscriptSegmentRecord) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO transcript_segments
+               (id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                language, text, confidence, adapter, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               started_at_ms = excluded.started_at_ms,
+               ended_at_ms = excluded.ended_at_ms,
+               speaker_label = excluded.speaker_label,
+               language = excluded.language,
+               text = excluded.text,
+               confidence = excluded.confidence,
+               adapter = excluded.adapter,
+               latency_ms = excluded.latency_ms",
+            params![
+                segment.id,
+                segment.session_id,
+                segment.started_at_ms,
+                segment.ended_at_ms,
+                segment.speaker_label,
+                segment.language,
+                segment.text,
+                segment.confidence,
+                segment.adapter,
+                segment.latency_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recent transcript segments for a session, newest first.
+    pub fn recent_transcript_segments(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<TranscriptSegmentRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                    language, text, confidence, adapter, latency_ms
+             FROM transcript_segments
+             WHERE session_id = ?1
+             ORDER BY started_at_ms DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, limit],
+            TranscriptSegmentRecord::from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Returns one transcript segment by id.
+    pub fn get_transcript_segment(
+        &self,
+        segment_id: &str,
+    ) -> StoreResult<Option<TranscriptSegmentRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, session_id, started_at_ms, ended_at_ms, speaker_label,
+                        language, text, confidence, adapter, latency_ms
+                 FROM transcript_segments
+                 WHERE id = ?1",
+                params![segment_id],
+                TranscriptSegmentRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripture candidates (v9 wiring)
+    // -----------------------------------------------------------------------
+
+    /// Inserts one scripture candidate row.
+    pub fn insert_scripture_candidate(
+        &self,
+        candidate: &ScriptureCandidateRecord,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO scripture_candidates
+               (id, session_id, reference, translation_id, language, score,
+                bucket, status, reason, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+               reference = excluded.reference,
+               translation_id = excluded.translation_id,
+               language = excluded.language,
+               score = excluded.score,
+               bucket = excluded.bucket,
+               status = excluded.status,
+               reason = excluded.reason",
+            params![
+                candidate.id,
+                candidate.session_id,
+                candidate.reference,
+                candidate.translation_id,
+                candidate.language,
+                candidate.score,
+                candidate.bucket,
+                candidate.status,
+                candidate.reason,
+                candidate.created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Updates the status field of a candidate (e.g. `"pending"` →
+    /// `"approved"` | `"rejected"` | `"live"` | `"cleared"`).
+    pub fn update_scripture_candidate_status(
+        &self,
+        candidate_id: &str,
+        status: &str,
+    ) -> StoreResult<usize> {
+        Ok(self.connection.execute(
+            "UPDATE scripture_candidates SET status = ?1 WHERE id = ?2",
+            params![status, candidate_id],
+        )?)
+    }
+
+    /// Returns the most recent candidates for a session, newest first.
+    pub fn recent_scripture_candidates(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<ScriptureCandidateRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, reference, translation_id, language, score,
+                    bucket, status, reason, created_at_ms
+             FROM scripture_candidates
+             WHERE session_id = ?1
+             ORDER BY created_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, limit],
+            ScriptureCandidateRecord::from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Returns one scripture candidate by id.
+    pub fn get_scripture_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> StoreResult<Option<ScriptureCandidateRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, session_id, reference, translation_id, language, score,
+                        bucket, status, reason, created_at_ms
+                 FROM scripture_candidates
+                 WHERE id = ?1",
+                params![candidate_id],
+                ScriptureCandidateRecord::from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator actions (v9)
+    // -----------------------------------------------------------------------
+
+    /// Records one operator verdict. Returns the new row id.
+    pub fn insert_operator_action(&self, action: &OperatorActionRecord) -> StoreResult<i64> {
+        self.connection.execute(
+            "INSERT INTO operator_actions
+               (session_id, candidate_id, action_type, actor, payload_json, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                action.session_id,
+                action.candidate_id,
+                action.action_type,
+                action.actor,
+                action.payload_json,
+                action.occurred_at_ms,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Lists the most recent operator actions for a session, newest first.
+    pub fn recent_operator_actions(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<OperatorActionRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, candidate_id, action_type, actor, payload_json, occurred_at_ms
+             FROM operator_actions
+             WHERE session_id = ?1
+             ORDER BY occurred_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], OperatorActionRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Display events (v9)
+    // -----------------------------------------------------------------------
+
+    /// Records a display event (preview, take-live, extend, or clear).
+    pub fn insert_display_event(&self, event: &DisplayEventRecord) -> StoreResult<i64> {
+        self.connection.execute(
+            "INSERT INTO display_events
+               (session_id, candidate_id, action, output_target, triggered_by,
+                locked_at_ms, released_at_ms, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.session_id,
+                event.candidate_id,
+                event.action,
+                event.output_target,
+                event.triggered_by,
+                event.locked_at_ms,
+                event.released_at_ms,
+                event.detail_json,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Lists the most recent display events for a session, newest first.
+    pub fn recent_display_events(
+        &self,
+        session_id: &str,
+        limit: u16,
+    ) -> StoreResult<Vec<DisplayEventRecord>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, session_id, candidate_id, action, output_target,
+                    triggered_by, locked_at_ms, released_at_ms, detail_json
+             FROM display_events
+             WHERE session_id = ?1
+             ORDER BY locked_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], DisplayEventRecord::from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Gives advanced services controlled access to the connection.
@@ -596,11 +1113,14 @@ impl AletheiaStore {
     /// Reads a UI-side document from the key/value store. Returns the raw
     /// JSON string so the caller can deserialize against any DTO shape.
     pub fn kv_get(&self, key: &str) -> StoreResult<Option<String>> {
-        Ok(self.connection.query_row(
-            "SELECT value_json FROM app_kv WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        ).optional()?)
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT value_json FROM app_kv WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Upserts a UI-side document. `now_ms` is supplied by the caller so
@@ -617,14 +1137,16 @@ impl AletheiaStore {
 
     /// Removes a key/value pair. Returns the number of rows deleted (0 or 1).
     pub fn kv_delete(&self, key: &str) -> StoreResult<usize> {
-        Ok(self.connection.execute("DELETE FROM app_kv WHERE key = ?1", params![key])?)
+        Ok(self
+            .connection
+            .execute("DELETE FROM app_kv WHERE key = ?1", params![key])?)
     }
 
     /// Lists all `(key, updated_at_ms)` pairs for client-side cache headers.
     pub fn kv_list_keys(&self) -> StoreResult<Vec<(String, i64)>> {
-        let mut stmt = self.connection.prepare(
-            "SELECT key, updated_at_ms FROM app_kv ORDER BY key ASC",
-        )?;
+        let mut stmt = self
+            .connection
+            .prepare("SELECT key, updated_at_ms FROM app_kv ORDER BY key ASC")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -865,6 +1387,189 @@ impl CalibrationSampleRecord {
     }
 }
 
+/// Local operator-confirmed phrase memory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LearnedScripturePhraseRecord {
+    pub id: i64,
+    pub phrase_key: String,
+    pub phrase: String,
+    pub reference: String,
+    pub translation_id: String,
+    pub language: String,
+    pub source: String,
+    pub confidence: f64,
+    pub use_count: i64,
+    pub learned_at_ms: TimestampMs,
+    pub updated_at_ms: TimestampMs,
+}
+
+impl LearnedScripturePhraseRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            phrase_key: row.get(1)?,
+            phrase: row.get(2)?,
+            reference: row.get(3)?,
+            translation_id: row.get(4)?,
+            language: row.get(5)?,
+            source: row.get(6)?,
+            confidence: row.get(7)?,
+            use_count: row.get(8)?,
+            learned_at_ms: row.get(9)?,
+            updated_at_ms: row.get(10)?,
+        })
+    }
+}
+
+/// Service session row (v9 wiring).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceSessionRecord {
+    pub id: String,
+    pub name: String,
+    pub started_at_ms: TimestampMs,
+    pub ended_at_ms: Option<TimestampMs>,
+    pub data_miser_enabled: bool,
+    pub offline_mode_enabled: bool,
+}
+
+impl ServiceSessionRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            started_at_ms: row.get(2)?,
+            ended_at_ms: row.get(3)?,
+            data_miser_enabled: row.get::<_, i64>(4)? != 0,
+            offline_mode_enabled: row.get::<_, i64>(5)? != 0,
+        })
+    }
+}
+
+/// Transcript segment row (v9 wiring).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscriptSegmentRecord {
+    pub id: String,
+    pub session_id: String,
+    pub started_at_ms: TimestampMs,
+    pub ended_at_ms: TimestampMs,
+    pub speaker_label: Option<String>,
+    pub language: String,
+    pub text: String,
+    pub confidence: f64,
+    pub adapter: String,
+    pub latency_ms: i64,
+}
+
+impl TranscriptSegmentRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            started_at_ms: row.get(2)?,
+            ended_at_ms: row.get(3)?,
+            speaker_label: row.get(4)?,
+            language: row.get(5)?,
+            text: row.get(6)?,
+            confidence: row.get(7)?,
+            adapter: row.get(8)?,
+            latency_ms: row.get(9)?,
+        })
+    }
+}
+
+/// Scripture candidate row (v9 wiring).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptureCandidateRecord {
+    pub id: String,
+    pub session_id: String,
+    pub reference: String,
+    pub translation_id: String,
+    pub language: String,
+    pub score: f64,
+    pub bucket: String,
+    /// `"pending"` | `"preview"` | `"live"` | `"rejected"` | `"cleared"`.
+    pub status: String,
+    pub reason: String,
+    pub created_at_ms: TimestampMs,
+}
+
+impl ScriptureCandidateRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            reference: row.get(2)?,
+            translation_id: row.get(3)?,
+            language: row.get(4)?,
+            score: row.get(5)?,
+            bucket: row.get(6)?,
+            status: row.get(7)?,
+            reason: row.get(8)?,
+            created_at_ms: row.get(9)?,
+        })
+    }
+}
+
+/// Operator action row (v9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OperatorActionRecord {
+    /// Row id, 0 on insert.
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    /// `"approve"` | `"reject"` | `"preview"` | `"live"` | `"merge"` | `"extend"` | `"clear"` | `"panic_clear"`.
+    pub action_type: String,
+    pub actor: String,
+    pub payload_json: String,
+    pub occurred_at_ms: TimestampMs,
+}
+
+impl OperatorActionRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            candidate_id: row.get(2)?,
+            action_type: row.get(3)?,
+            actor: row.get(4)?,
+            payload_json: row.get(5)?,
+            occurred_at_ms: row.get(6)?,
+        })
+    }
+}
+
+/// Display event row (v9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayEventRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub candidate_id: Option<String>,
+    /// `"preview"` | `"live"` | `"extend"` | `"clear"` | `"panic_clear"`.
+    pub action: String,
+    /// `"projector"` | `"vmix"` | `"obs"` | `"propresenter"` | `"easyworship"` | `"all"` | ...
+    pub output_target: String,
+    pub triggered_by: String,
+    pub locked_at_ms: TimestampMs,
+    pub released_at_ms: Option<TimestampMs>,
+    pub detail_json: String,
+}
+
+impl DisplayEventRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            candidate_id: row.get(2)?,
+            action: row.get(3)?,
+            output_target: row.get(4)?,
+            triggered_by: row.get(5)?,
+            locked_at_ms: row.get(6)?,
+            released_at_ms: row.get(7)?,
+            detail_json: row.get(8)?,
+        })
+    }
+}
+
 /// Audit event row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditEventRecord {
@@ -910,6 +1615,23 @@ pub enum StoreError {
         on_disk: i64,
         expected: i64,
     },
+}
+
+fn normalized_phrase_key(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .take(24)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl std::fmt::Display for StoreError {
@@ -1126,11 +1848,31 @@ CREATE TABLE IF NOT EXISTS calibration_samples (
   recorded_at_ms  INTEGER NOT NULL
 );
 
+-- v10: local adaptive scripture memory —————————————————————————————————————
+-- Operator-confirmed phrases only. Never trained from raw low-confidence audio.
+CREATE TABLE IF NOT EXISTS learned_scripture_phrases (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  phrase_key      TEXT NOT NULL,
+  phrase          TEXT NOT NULL,
+  reference       TEXT NOT NULL,
+  translation_id  TEXT NOT NULL,
+  language        TEXT NOT NULL,
+  source          TEXT NOT NULL,
+  confidence      REAL NOT NULL DEFAULT 1.0,
+  use_count       INTEGER NOT NULL DEFAULT 1,
+  learned_at_ms   INTEGER NOT NULL,
+  updated_at_ms   INTEGER NOT NULL,
+  UNIQUE(phrase_key, reference, translation_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_trusted_plugins_key
   ON trusted_plugins(key_id);
 
 CREATE INDEX IF NOT EXISTS idx_calibration_samples_lang
   ON calibration_samples(language, recorded_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_learned_scripture_phrases_translation
+  ON learned_scripture_phrases(translation_id, use_count DESC, updated_at_ms DESC);
 
 -- v7: runtime state persistence —————————————————————————————————————————————
 CREATE TABLE IF NOT EXISTS runtime_state (
@@ -1147,6 +1889,41 @@ CREATE TABLE IF NOT EXISTS app_kv (
   value_json TEXT NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
+
+-- v9: operator actions on scripture candidates (approve, reject, merge,
+-- extend, pin). Every verdict the operator records becomes one row so that
+-- the queue is reconstructible after a mid-service crash and accuracy
+-- analytics can be computed post-service.
+CREATE TABLE IF NOT EXISTS operator_actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES service_sessions(id) ON DELETE CASCADE,
+  candidate_id TEXT,
+  action_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL
+);
+
+-- v9: display events — every push to preview, take-live, extend, or clear
+-- on any output target. Lets us replay a service end-to-end and compute
+-- TTDisplay latency metrics.
+CREATE TABLE IF NOT EXISTS display_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES service_sessions(id) ON DELETE CASCADE,
+  candidate_id TEXT,
+  action TEXT NOT NULL,
+  output_target TEXT NOT NULL,
+  triggered_by TEXT NOT NULL,
+  locked_at_ms INTEGER NOT NULL,
+  released_at_ms INTEGER,
+  detail_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_actions_session_time
+  ON operator_actions(session_id, occurred_at_ms DESC);
+
+CREATE INDEX IF NOT EXISTS idx_display_events_session_time
+  ON display_events(session_id, locked_at_ms DESC);
 "#;
 
 #[cfg(test)]
@@ -1223,6 +2000,76 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].book, "Psalm");
+    }
+
+    #[test]
+    fn keyword_candidate_search_finds_mid_verse_terms() {
+        let store = AletheiaStore::open_memory().expect("store opens");
+        store
+            .insert_translation(&TranslationRecord {
+                id: "kjv".to_string(),
+                name: "King James Version".to_string(),
+                language: "English".to_string(),
+                license: "public-domain".to_string(),
+                offline_ready: true,
+            })
+            .expect("translation inserted");
+        store
+            .insert_verse(&VerseRecord {
+                translation_id: "kjv".to_string(),
+                book: "Genesis".to_string(),
+                chapter: 50,
+                verse: 20,
+                text: "But as for you, ye thought evil against me; but God meant it unto good."
+                    .to_string(),
+            })
+            .expect("verse inserted");
+
+        let results = store
+            .search_keyword_candidates(
+                "kjv",
+                &["god".to_string(), "meant".to_string(), "good".to_string()],
+                10,
+            )
+            .expect("search succeeds");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].book, "Genesis");
+    }
+
+    #[test]
+    fn upserts_and_lists_learned_scripture_phrases() {
+        let store = AletheiaStore::open_memory().expect("store opens");
+
+        store
+            .upsert_learned_scripture_phrase(
+                "when pastor says the woman by the well",
+                "John 4:7",
+                "kjv",
+                "en",
+                "approve",
+                1_000,
+            )
+            .expect("learned phrase inserted");
+        store
+            .upsert_learned_scripture_phrase(
+                "when pastor says the woman by the well",
+                "John 4:7",
+                "kjv",
+                "en",
+                "live",
+                2_000,
+            )
+            .expect("learned phrase updated");
+
+        let learned = store
+            .list_learned_scripture_phrases("kjv", 10)
+            .expect("learned phrases listed");
+
+        assert_eq!(learned.len(), 1);
+        assert_eq!(learned[0].reference, "John 4:7");
+        assert_eq!(learned[0].use_count, 2);
+        assert_eq!(learned[0].updated_at_ms, 2_000);
     }
 
     #[test]

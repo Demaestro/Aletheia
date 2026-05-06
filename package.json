@@ -10,17 +10,29 @@
     "typecheck": "tsc -p tsconfig.typecheck.json",
     "tauri": "tauri",
     "desktop:dev": "tauri dev --config src-tauri/tauri.conf.dev.json",
-    "desktop:launch": "node scripts/dev.mjs",
+    "desktop:launch": "tauri dev",
+    "desktop:launch:fast": "tauri dev",
+    "desktop:launch:legacy": "node scripts/dev.mjs",
     "desktop:build": "tauri build --bundles deb,rpm",
     "desktop:build:linux": "tauri build --bundles deb,rpm",
     "desktop:build:windows": "tauri build --bundles msi,nsis",
     "desktop:build:all": "tauri build",
+    "vector:install": "node scripts/vector-kb-runner.mjs install",
+    "vector:build": "node scripts/vector-kb-runner.mjs build",
+    "vector:serve": "node scripts/vector-kb-runner.mjs serve",
+    "vector:serve:wsl": "cmd.exe /c C:\\dev\\aletheia\\scripts\\run-vector-serve-wsl.cmd",
+    "vector:build:all:wsl": "cmd.exe /c C:\\dev\\aletheia\\scripts\\run-vector-build-all-wsl.cmd",
+    "vector:search": "node scripts/vector-kb-runner.mjs search",
+    "vector:status": "node scripts/vector-kb-runner.mjs status",
+    "diagnose:scripture": "node scripts/diagnose-scripture.mjs",
+    "smoke:desktop-launch": "node scripts/smoke-desktop-launch.mjs",
+    "smoke:vector-kb": "node scripts/smoke-vector-kb.mjs",
     "smoke:production-ui": "node scripts/smoke-production-ui.mjs",
     "verify:production": "./scripts/verify-production.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/cli-win32-x64-msvc": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.7.0",
     "@vitejs/plugin-react": "^5.0.0",
     "framer-motion": "^12.0.0",
     "i18next": "^26.0.5",
@@ -43,6 +55,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
-    "vite": "^6.0.1"
+    "vite": "^6.0.1",
+    "vitest": "^4.1.5"
   }
 }

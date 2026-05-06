@@ -503,7 +503,7 @@ fn ws_upgrade(stream: &mut TcpStream, timeout: &Duration) -> Result<(), ObsError
     let accept_header = response
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|l| l.split_once(':').map(|(_, value)| value))
         .map(|v| v.trim().to_string())
         .unwrap_or_default();
 
@@ -679,7 +679,7 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
         }
 
         let [mut a, mut b, mut c, mut d, mut e] = h;
-        for i in 0..80 {
+        for (i, word) in w.iter().enumerate() {
             let (f, k) = match i {
                 0..=19 => ((b & c) | ((!b) & d), 0x5A827999_u32),
                 20..=39 => (b ^ c ^ d, 0x6ED9EBA1_u32),
@@ -691,7 +691,7 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
                 .wrapping_add(f)
                 .wrapping_add(e)
                 .wrapping_add(k)
-                .wrapping_add(w[i]);
+                .wrapping_add(*word);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -1000,13 +1000,25 @@ mod tests {
     #[test]
     fn loopback_is_always_allowed() {
         let config = ObsConfig::default();
-        assert!(check_address_policy(&config, "127.0.0.1".parse().unwrap()).is_ok());
+        assert!(
+            check_address_policy(
+                &config,
+                "127.0.0.1".parse().expect("test IP literal must parse")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn lan_blocked_by_default() {
         let config = ObsConfig::default();
-        assert!(check_address_policy(&config, "192.168.1.50".parse().unwrap()).is_err());
+        assert!(
+            check_address_policy(
+                &config,
+                "192.168.1.50".parse().expect("test IP literal must parse")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1015,7 +1027,13 @@ mod tests {
             allow_private_network: true,
             ..ObsConfig::default()
         };
-        assert!(check_address_policy(&config, "192.168.1.50".parse().unwrap()).is_ok());
+        assert!(
+            check_address_policy(
+                &config,
+                "192.168.1.50".parse().expect("test IP literal must parse")
+            )
+            .is_ok()
+        );
     }
 
     // ---- Overlay text formatting --------------------------------------------

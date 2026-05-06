@@ -6,13 +6,28 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use aletheia_core::IntegrationId;
 use aletheia_output::{
     OutputAdapter, OutputAdapterStatus, OutputCapability, OutputError, OutputHealth, OutputKind,
     OutputLayer, OutputScene,
 };
+
+/// Operator-visible debounce window for duplicate sends. The architectural
+/// vision calls for "Suppress duplicate triggers within 2–3 seconds" so the
+/// projection layer never re-fires an overlay-in / re-pushes identical text
+/// while a verse is still on screen.
+const DEFAULT_DEDUP_WINDOW_MS: u64 = 2500;
+/// Health-check cache TTL. UI calls to `status()` use a cached result when
+/// it is fresher than this so we don't pay an HTTP round-trip per render.
+const HEALTH_CACHE_TTL_MS: u64 = 1500;
+/// Number of attempts (including the first) for transient-failure retry.
+const SEND_ATTEMPTS: u32 = 3;
+/// Backoff steps between attempts. Short — operators expect snappy recovery
+/// and the underlying call is loopback-fast on a healthy vMix.
+const SEND_BACKOFF_MS: &[u64] = &[80, 200];
 
 /// vMix Web API defaults for a local operator machine.
 pub const DEFAULT_VMIX_HOST: &str = "127.0.0.1";
@@ -94,12 +109,42 @@ impl VmixConfig {
 /// Adapter facade used by Tauri and future integration workers.
 pub struct VmixAdapter {
     config: VmixConfig,
+    /// Cached signature of the last successful send, used to suppress
+    /// duplicate sends inside [`DEFAULT_DEDUP_WINDOW_MS`].
+    last_sent: Mutex<Option<LastSent>>,
+    /// Cached health-check result so repeated `status()` calls don't
+    /// stampede the vMix HTTP API.
+    health_cache: Mutex<Option<CachedHealth>>,
+}
+
+#[derive(Clone, Debug)]
+struct LastSent {
+    verse: String,
+    reference: String,
+    layer: SendLayer,
+    at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendLayer {
+    Preview,
+    Live,
+}
+
+#[derive(Clone, Debug)]
+struct CachedHealth {
+    health: OutputHealth,
+    at: Instant,
 }
 
 impl VmixAdapter {
     /// Creates a vMix adapter from explicit configuration.
     pub fn new(config: VmixConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            last_sent: Mutex::new(None),
+            health_cache: Mutex::new(None),
+        }
     }
 
     /// Returns immutable configuration for UI status and diagnostics.
@@ -146,6 +191,93 @@ impl VmixAdapter {
             self.run_function("ResumeRender", &[Param::input(&self.config.title_input)]);
         update_result?;
         resume_result
+    }
+
+    /// Returns true and silently skips the work when the same `(verse,
+    /// reference, layer)` was already sent within `DEFAULT_DEDUP_WINDOW_MS`.
+    /// Updates the last-sent cache as a side effect.
+    fn dedup_or_record(&self, verse: &str, reference: &str, layer: SendLayer) -> bool {
+        let mut guard = match self.last_sent.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if let Some(prev) = guard.as_ref() {
+            let still_fresh = prev.at.elapsed() < Duration::from_millis(DEFAULT_DEDUP_WINDOW_MS);
+            if still_fresh
+                && prev.layer == layer
+                && prev.verse == verse
+                && prev.reference == reference
+            {
+                return true;
+            }
+        }
+        *guard = Some(LastSent {
+            verse: verse.to_string(),
+            reference: reference.to_string(),
+            layer,
+            at: Instant::now(),
+        });
+        false
+    }
+
+    /// Clears the last-sent cache so the next send (e.g. after a manual
+    /// `clear()`) is never silently suppressed.
+    fn forget_last_sent(&self) {
+        if let Ok(mut guard) = self.last_sent.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Runs `f` with up to `SEND_ATTEMPTS` retries on transient failures.
+    /// Permanent failures (config, blocked address) bail immediately —
+    /// retrying them would just delay the operator-visible error.
+    fn with_retry<F, T>(&self, mut f: F) -> Result<T, VmixError>
+    where
+        F: FnMut() -> Result<T, VmixError>,
+    {
+        let mut last_err: Option<VmixError> = None;
+        for attempt in 0..SEND_ATTEMPTS {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(err) => {
+                    if !is_transient(&err) {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                    if let Some(delay_ms) = SEND_BACKOFF_MS.get(attempt as usize) {
+                        std::thread::sleep(Duration::from_millis(*delay_ms));
+                    }
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| VmixError::ConnectionFailed("vMix retries exhausted".to_string())))
+    }
+
+    /// Returns a cached health result when fresh, else probes the API.
+    fn cached_or_fresh_health(&self) -> OutputHealth {
+        if let Ok(guard) = self.health_cache.lock() {
+            if let Some(cached) = guard.as_ref() {
+                if cached.at.elapsed() < Duration::from_millis(HEALTH_CACHE_TTL_MS) {
+                    return cached.health.clone();
+                }
+            }
+        }
+        let health = match self.check_status() {
+            Ok(status) if status.title_input_found => OutputHealth::Connected,
+            Ok(status) => OutputHealth::Degraded(format!(
+                "API reachable at {}, but title input '{}' was not found",
+                status.endpoint, status.title_input
+            )),
+            Err(error) => OutputHealth::Offline(error.to_string()),
+        };
+        if let Ok(mut guard) = self.health_cache.lock() {
+            *guard = Some(CachedHealth {
+                health: health.clone(),
+                at: Instant::now(),
+            });
+        }
+        health
     }
 
     fn set_title_text(&self, field_name: &str, value: &str) -> Result<(), VmixError> {
@@ -203,15 +335,6 @@ impl Default for VmixAdapter {
 
 impl OutputAdapter for VmixAdapter {
     fn status(&self) -> OutputAdapterStatus {
-        let health = match self.check_status() {
-            Ok(status) if status.title_input_found => OutputHealth::Connected,
-            Ok(status) => OutputHealth::Degraded(format!(
-                "API reachable at {}, but title input '{}' was not found",
-                status.endpoint, status.title_input
-            )),
-            Err(error) => OutputHealth::Offline(error.to_string()),
-        };
-
         OutputAdapterStatus {
             id: integration_id_or_fallback(&self.config.integration_id),
             display_name: "vMix".to_string(),
@@ -222,7 +345,7 @@ impl OutputAdapter for VmixAdapter {
                 OutputCapability::Clear,
                 OutputCapability::DryRun,
             ],
-            health,
+            health: self.cached_or_fresh_health(),
         }
     }
 
@@ -237,31 +360,62 @@ impl OutputAdapter for VmixAdapter {
     }
 
     fn send_preview(&mut self, scene: &OutputScene) -> Result<(), OutputError> {
-        self.update_title_fields(scene)
-            .map_err(output_error_from_vmix)?;
-        self.run_function(
-            &format!("PreviewOverlayInput{}", self.config.overlay_channel),
-            &[Param::input(&self.config.title_input)],
-        )
+        let verse = layer_text(scene, OutputLayer::Verse).to_string();
+        let reference = layer_text(scene, OutputLayer::Reference).to_string();
+        if self.dedup_or_record(&verse, &reference, SendLayer::Preview) {
+            // Same content already pushed within the dedup window — skip the
+            // overlay/SetText round-trip rather than re-trigger and flicker.
+            return Ok(());
+        }
+        self.with_retry(|| {
+            self.update_title_fields(scene)?;
+            self.run_function(
+                &format!("PreviewOverlayInput{}", self.config.overlay_channel),
+                &[Param::input(&self.config.title_input)],
+            )
+        })
         .map_err(output_error_from_vmix)
     }
 
     fn send_live(&mut self, scene: &OutputScene) -> Result<(), OutputError> {
-        self.update_title_fields(scene)
-            .map_err(output_error_from_vmix)?;
-        self.run_function(
-            &format!("OverlayInput{}In", self.config.overlay_channel),
-            &[Param::input(&self.config.title_input)],
-        )
+        let verse = layer_text(scene, OutputLayer::Verse).to_string();
+        let reference = layer_text(scene, OutputLayer::Reference).to_string();
+        if self.dedup_or_record(&verse, &reference, SendLayer::Live) {
+            return Ok(());
+        }
+        self.with_retry(|| {
+            self.update_title_fields(scene)?;
+            self.run_function(
+                &format!("OverlayInput{}In", self.config.overlay_channel),
+                &[Param::input(&self.config.title_input)],
+            )
+        })
         .map_err(output_error_from_vmix)
     }
 
     fn clear(&mut self) -> Result<(), OutputError> {
-        self.run_function(
-            &format!("OverlayInput{}Out", self.config.overlay_channel),
-            &[],
-        )
+        // Clearing the overlay must always reach vMix — never dedup it.
+        // Forget the last-sent signature so the next live/preview push is
+        // not silently suppressed.
+        self.forget_last_sent();
+        self.with_retry(|| {
+            self.run_function(
+                &format!("OverlayInput{}Out", self.config.overlay_channel),
+                &[],
+            )
+        })
         .map_err(output_error_from_vmix)
+    }
+}
+
+/// Classifies an error as transient (worth retrying) vs permanent.
+/// `ConnectionFailed` and 5xx status codes are transient — common when
+/// vMix is mid-frame on a busy show. Auth/config issues are not.
+fn is_transient(err: &VmixError) -> bool {
+    match err {
+        VmixError::ConnectionFailed(_) | VmixError::MalformedResponse(_) => true,
+        VmixError::HttpStatus { code, .. } => *code >= 500,
+        VmixError::InvalidConfig(_) | VmixError::AddressBlocked(_) => false,
     }
 }
 
@@ -505,10 +659,9 @@ fn build_basic_auth_header(username: Option<&str>, password: Option<&str>) -> Op
 }
 
 fn base64_encode(input: &str) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);

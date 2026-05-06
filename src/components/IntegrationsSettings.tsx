@@ -4,13 +4,17 @@ import { integrations as defaultIntegrations } from "../data/production";
 import {
   generateEasyWorshipSmbSetupGuide,
   exportOperatorConfig,
-  importOperatorConfig
+  importOperatorConfig,
+  vaultDeleteSecret,
+  vaultReadSecret,
+  vaultStoreSecret
 } from "../services/desktopApi";
 
 import type {
   AdapterDispatchResult,
   BoothPackExport,
   CompanionConfig,
+  DesktopRuntimeStatus,
   EasyWorshipConfig,
   Integration,
   IntegrationEvent,
@@ -24,6 +28,8 @@ import type {
   VmixStatus
 } from "../types";
 import { ActionButton, SectionHeader, StatusPill } from "./Primitives";
+
+const CLOUD_AI_SECRET_LABEL = "openai-api-key";
 
 const categories = [
   { title: "Presentation", detail: "EasyWorship and ProPresenter handoff.", icon: FileText },
@@ -99,6 +105,7 @@ export function IntegrationsSettings({
   easyWorshipStatus,
   operatorName = "",
   trustedPlugins = [],
+  desktopStatus,
   onSaveVmixConfig,
   onCheckVmix,
   onSendVmixPreview,
@@ -137,6 +144,7 @@ export function IntegrationsSettings({
   pluginVerification,
   onSaveOperatorName,
   onRevokePlugin,
+  onSetCloudAiEnabled,
 }: {
   integrations?: Integration[];
   vmixStatus?: VmixStatus;
@@ -148,6 +156,7 @@ export function IntegrationsSettings({
   easyWorshipStatus?: AdapterDispatchResult | null;
   operatorName?: string;
   trustedPlugins?: TrustedPlugin[];
+  desktopStatus?: DesktopRuntimeStatus | null;
   onSaveVmixConfig?: (config: VmixConfig) => void;
   onCheckVmix?: () => void;
   onSendVmixPreview?: () => void;
@@ -186,6 +195,7 @@ export function IntegrationsSettings({
   pluginVerification?: PluginVerificationResult | null;
   onSaveOperatorName?: (name: string) => void;
   onRevokePlugin?: (pluginId: string) => void;
+  onSetCloudAiEnabled?: (enabled: boolean) => void;
 }) {
   const [draft, setDraft] = useState<VmixConfig>(toConfig(vmixStatus));
   const [obsDraft, setObsDraft] = useState<ObsConfig>(defaultObsConfig);
@@ -203,6 +213,9 @@ export function IntegrationsSettings({
   const [showImportModal, setShowImportModal] = useState(false);
   const [importText, setImportText] = useState("");
   const [configMessage, setConfigMessage] = useState<string | null>(null);
+  const [cloudAiKey, setCloudAiKey] = useState("");
+  const [cloudAiHasKey, setCloudAiHasKey] = useState(false);
+  const [cloudAiMessage, setCloudAiMessage] = useState<string | null>(null);
 
   const saveCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -232,6 +245,39 @@ export function IntegrationsSettings({
     const t = setTimeout(() => setVmixSaveResult(null), 4000);
     return () => clearTimeout(t);
   }, [vmixSaveResult]);
+
+  useEffect(() => {
+    let active = true;
+    void vaultReadSecret(CLOUD_AI_SECRET_LABEL).then((secret) => {
+      if (!active) return;
+      setCloudAiHasKey(Boolean(secret));
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleSaveCloudAiKey = async () => {
+    const trimmed = cloudAiKey.trim();
+    if (!trimmed) {
+      setCloudAiMessage("Paste an API key before saving.");
+      return;
+    }
+    const saved = await vaultStoreSecret(CLOUD_AI_SECRET_LABEL, trimmed);
+    if (saved) {
+      setCloudAiKey("");
+      setCloudAiHasKey(true);
+      setCloudAiMessage("Cloud AI key saved in the OS vault.");
+    } else {
+      setCloudAiMessage("Could not save the key to the OS vault.");
+    }
+  };
+
+  const handleDeleteCloudAiKey = async () => {
+    await vaultDeleteSecret(CLOUD_AI_SECRET_LABEL);
+    setCloudAiHasKey(false);
+    setCloudAiMessage("Cloud AI key removed from the OS vault.");
+  };
 
   const handleSaveAndCheckVmix = () => {
     onSaveVmixConfig?.(draft);
@@ -278,6 +324,7 @@ export function IntegrationsSettings({
   const companionTone = statusTone(companionStatus?.state ?? "offline");
   const oscTone = statusTone(oscStatus?.state ?? "offline");
   const ewTone = statusTone(easyWorshipStatus?.state ?? "offline");
+  const cloudAiEnabled = desktopStatus ? !desktopStatus.dataMiserEnabled : false;
 
   useEffect(() => {
     setDraft(toConfig(vmixStatus));
@@ -292,7 +339,7 @@ export function IntegrationsSettings({
         action={<ActionButton onClick={onCheckVmix}>Check vMix</ActionButton>}
       />
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
         {categories.map((category) => {
           const Icon = category.icon;
           return (
@@ -305,33 +352,109 @@ export function IntegrationsSettings({
         })}
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="rounded-[6px] border border-white/5 bg-white/5">
-          <div className="grid grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] border-b border-white/5 px-4 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-muted">
-            <span>Adapter</span>
-            <span>Transport</span>
-            <span>Capability</span>
+      <div className="rounded-[8px] border border-white/8 bg-white/[0.035] p-5">
+        <div className="grid gap-5 xl:grid-cols-[1fr_420px]">
+          <div>
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-muted">Optional cloud AI</p>
+              <StatusPill tone={cloudAiEnabled && cloudAiHasKey ? "healthy" : "offline"} label={cloudAiEnabled && cloudAiHasKey ? "enabled" : "local only"} />
+            </div>
+            <h3 className="mt-2 text-lg font-semibold tracking-tight text-ink">Scripture intelligence assist</h3>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">
+              Local Bible lookup stays primary. When enabled, Aletheia sends only recent transcript text and local candidate references to OpenAI for reranking and scene-style scripture discovery.
+              Audio, secrets, and integration credentials are never sent.
+            </p>
+            <div className="mt-4 grid gap-3 text-xs text-muted sm:grid-cols-3">
+              <div className="rounded-[6px] border border-white/8 bg-paper p-3">
+                <p className="font-semibold text-ink">Fail-closed</p>
+                <p className="mt-1 leading-5">If the request fails, the offline detector continues unchanged.</p>
+              </div>
+              <div className="rounded-[6px] border border-white/8 bg-paper p-3">
+                <p className="font-semibold text-ink">Operator controlled</p>
+                <p className="mt-1 leading-5">Data Miser off allows cloud assist. Data Miser on forces local-only mode.</p>
+              </div>
+              <div className="rounded-[6px] border border-white/8 bg-paper p-3">
+                <p className="font-semibold text-ink">Vault stored</p>
+                <p className="mt-1 leading-5">The API key is stored in the OS vault, not in project files or exports.</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <label className="block text-xs font-semibold uppercase tracking-widest text-muted" htmlFor="cloud-ai-key">
+              OpenAI API key
+            </label>
+            <input
+              id="cloud-ai-key"
+              type="password"
+              value={cloudAiKey}
+              onChange={(event) => setCloudAiKey(event.target.value)}
+              placeholder={cloudAiHasKey ? "Key saved in OS vault" : "sk-..."}
+              className="w-full rounded-[6px] border border-white/10 bg-paper px-3 py-2 text-sm text-ink outline-none transition focus:border-accent"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <div className="flex flex-wrap gap-2">
+              <ActionButton tone="secondary" onClick={() => void handleSaveCloudAiKey()}>
+                Save key
+              </ActionButton>
+              <ActionButton tone="secondary" onClick={() => onSetCloudAiEnabled?.(!cloudAiEnabled)} disabled={!cloudAiHasKey}>
+                {cloudAiEnabled ? "Disable cloud AI" : "Enable cloud AI"}
+              </ActionButton>
+              <ActionButton tone="danger" onClick={() => void handleDeleteCloudAiKey()} disabled={!cloudAiHasKey}>
+                Remove key
+              </ActionButton>
+            </div>
+            {cloudAiMessage && <p className="text-xs leading-5 text-muted">{cloudAiMessage}</p>}
+            {!cloudAiHasKey && (
+              <p className="text-xs leading-5 text-muted">
+                Create an OpenAI API key in your OpenAI dashboard, paste it here, then enable cloud AI.
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Adapter list + vMix config ── */}
+      <div className="grid gap-5 2xl:grid-cols-[1fr_440px]">
+
+        {/* Adapter cards */}
+        <div className="overflow-hidden rounded-[8px] border border-white/8 bg-white/[0.035]">
+
+          {/* Column header */}
+          <div className="grid grid-cols-[1fr_auto] border-b border-white/8 px-5 py-3 text-[11px] font-semibold uppercase tracking-widest text-muted">
+            <span>Adapter · Capability</span>
             <span>Status</span>
           </div>
-          <div className="divide-y divide-line">
+
+          {/* Rows */}
+          <div className="divide-y divide-white/[0.05]">
             {integrations.map((integration) => (
               <button
                 key={integration.id}
                 type="button"
-                className="group grid w-full grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] items-center px-4 py-4 text-left transition hover:bg-mist focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                className="group flex w-full items-start gap-4 px-5 py-4 text-left transition-colors hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
               >
-                <span className="flex items-center gap-3">
-                  <span className="grid h-9 w-9 place-items-center rounded-[6px] border border-white/5 bg-paper">
-                    <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
-                  </span>
-                  <span>
-                    <span className="block text-sm font-semibold text-ink">{integration.name}</span>
-                    <span className="mt-1 block text-xs text-muted">{integration.detail}</span>
-                  </span>
+                {/* Icon */}
+                <span className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-white/8 bg-paper">
+                  <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
                 </span>
-                <span className="text-sm text-graphite">{integration.kind}</span>
-                <span className="text-sm text-muted">{integration.capability}</span>
-                <span className="flex justify-end">
+
+                {/* Name + transport + capability */}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-ink">{integration.name}</span>
+                  <span className="mt-0.5 block text-xs text-muted">
+                    <span className="font-medium text-graphite">{integration.kind}</span>
+                    {" — "}
+                    {integration.capability}
+                  </span>
+                  {integration.detail && (
+                    <span className="mt-1 block text-xs text-muted/70">{integration.detail}</span>
+                  )}
+                </span>
+
+                {/* Status pill */}
+                <span className="mt-0.5 flex-none">
                   <StatusPill tone={statusTone(integration.state)} label={integration.state} />
                 </span>
               </button>
@@ -339,14 +462,14 @@ export function IntegrationsSettings({
           </div>
         </div>
 
-        <aside className="space-y-4">
-          <div className="rounded-[6px] border border-white/5 bg-white/5 p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">vMix bridge</p>
-                <h3 className="mt-2 text-xl font-semibold tracking-tight text-ink">Overlay scripture title</h3>
+        <aside className="min-w-0 space-y-4">
+          <div className="rounded-[8px] border border-white/8 bg-white/[0.035] p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-muted">vMix bridge</p>
+                <h3 className="mt-1 text-lg font-semibold tracking-tight text-ink">Overlay scripture title</h3>
               </div>
-              <StatusPill tone={vmixTone} label={vmixStatus.state} />
+              <span className="flex-none"><StatusPill tone={vmixTone} label={vmixStatus.state} /></span>
             </div>
 
             <p className="mt-4 text-sm leading-6 text-muted">{vmixStatus.detail}</p>
@@ -880,7 +1003,7 @@ function TextField({ label, value, onChange }: { label: string; value: string; o
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );
@@ -896,7 +1019,7 @@ function NumberField({ label, value, min, max, onChange }: { label: string; valu
         max={max}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );

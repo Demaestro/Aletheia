@@ -9,10 +9,9 @@ WHISPER_DONT_GENERATE_BINDINGS = "1"
 # Redirect build artifacts outside OneDrive — the [build] key is what cargo
 # actually reads; CARGO_TARGET_DIR in [env] only reaches build scripts.
 [build]
-target-dir = "C:\\Users\\USER\\cargo-targets\\worship-production-interface"
+target-dir = "C:\\dev\\cargo-targets\\aletheia"
 
 # On Windows/Git-Bash, /usr/bin/link (a symlink tool) shadows MSVC link.exe.
 # Pin the MSVC linker explicitly so cargo always finds the right one.
 [target.x86_64-pc-windows-msvc]
 linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"
-

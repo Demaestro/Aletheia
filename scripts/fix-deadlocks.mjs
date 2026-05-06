@@ -2,7 +2,7 @@
 // these functions to record_audit(&store, ...) so we use the already-held lock.
 import { readFileSync, writeFileSync } from "fs";
 
-const path = "C:/Users/USER/OneDrive/Desktop/worship-production-interface/src-tauri/src/lib.rs";
+const path = "C:/dev/aletheia/src-tauri/src/lib.rs";
 const src = readFileSync(path, "utf8");
 const lines = src.split("\n");
 

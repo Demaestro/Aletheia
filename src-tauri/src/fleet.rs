@@ -28,7 +28,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex string has odd length".into());
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
@@ -96,7 +96,10 @@ pub fn sign_fleet_bundle(
         &state,
         AuditAction::PluginInstalled,
         &operator,
-        &format!("fleet-bundle signed: sha256={} signer={}", digest, signer_label),
+        &format!(
+            "fleet-bundle signed: sha256={} signer={}",
+            digest, signer_label
+        ),
     )?;
     record_integration_event_state(
         &state,

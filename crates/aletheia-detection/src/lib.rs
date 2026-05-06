@@ -15,12 +15,17 @@ pub enum DetectionTier {
 }
 
 /// Safety bucket used by the approval UI.
+///
+/// Boundaries follow the architectural-vision contract:
+/// * `Certain`  — score ≥ 0.92, eligible for auto-send when other rules pass
+/// * `Strong`   — 0.75 ≤ score < 0.92, prepared as next suggestion (operator confirms)
+/// * `Likely`   — 0.55 ≤ score < 0.75, requires explicit operator approval
+/// * `Unsafe`   — score < 0.55, dropped from the operator queue
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfidenceBucket {
     Certain,
     Strong,
     Likely,
-    Ambiguous,
     Unsafe,
 }
 
@@ -29,9 +34,8 @@ impl ConfidenceBucket {
     pub fn from_score(score: f32) -> Self {
         match score {
             value if value >= 0.92 => Self::Certain,
-            value if value >= 0.82 => Self::Strong,
-            value if value >= 0.68 => Self::Likely,
-            value if value >= 0.45 => Self::Ambiguous,
+            value if value >= 0.75 => Self::Strong,
+            value if value >= 0.55 => Self::Likely,
             _ => Self::Unsafe,
         }
     }
@@ -112,6 +116,115 @@ pub struct ConfidencePolicy {
     pub live_requires_operator: bool,
 }
 
+/// A scripture candidate after ranking, carrying the tiers that produced it.
+///
+/// A single reference may be backed by several signals (e.g. quote match +
+/// thematic catalog hit). The `tiers` vector records every signal that fired
+/// so the auto-open evaluator can apply the architectural-vision rules
+/// (quote needs lexical+semantic, never semantic-alone, etc.).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedCandidate {
+    pub reference: String,
+    pub score: f32,
+    pub tiers: Vec<DetectionTier>,
+}
+
+/// Decision returned by [`ConfidencePolicy::evaluate_auto_open`].
+///
+/// `Open` is the only state in which the projection layer is allowed to push
+/// content to live without operator interaction; every other state surfaces in
+/// the operator UI for confirmation or approval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoOpenDecision {
+    Open,
+    Prepare,
+    RequireApproval,
+    Ignore,
+}
+
+/// First-class operating mode that gates how detector output reaches outputs.
+///
+/// The architectural vision distinguishes five distinct postures:
+/// * `Manual`   — detector is advisory only; nothing auto-sends. Every send is
+///   an operator click.
+/// * `Assisted` — detector may prepare next-up, but the operator must confirm
+///   before anything goes live. Auto-open decisions are downgraded to
+///   `Prepare`.
+/// * `Auto`     — trusts the safety policy. `AutoOpenDecision::Open` is taken
+///   as-is; everything else still surfaces for approval.
+/// * `Rehearsal` — same gating as `Auto` but the live output adapter is
+///   replaced with a no-op (mock vMix). Used for end-to-end dry runs.
+/// * `Mock`     — entire output stack is simulated. No external systems are
+///   touched. Dev/demo only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum OperatingMode {
+    Manual,
+    Assisted,
+    Auto,
+    Rehearsal,
+    Mock,
+}
+
+impl Default for OperatingMode {
+    /// `Assisted` is the safe default: detection helps, operator confirms.
+    fn default() -> Self {
+        Self::Assisted
+    }
+}
+
+impl OperatingMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Assisted => "assisted",
+            Self::Auto => "auto",
+            Self::Rehearsal => "rehearsal",
+            Self::Mock => "mock",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "manual" => Some(Self::Manual),
+            "assisted" => Some(Self::Assisted),
+            "auto" => Some(Self::Auto),
+            "rehearsal" => Some(Self::Rehearsal),
+            "mock" => Some(Self::Mock),
+            _ => None,
+        }
+    }
+
+    /// True when the mode allows real external side effects (vMix, projector).
+    /// `Rehearsal` and `Mock` swap in inert adapters and return false.
+    pub fn allows_real_outputs(&self) -> bool {
+        matches!(self, Self::Manual | Self::Assisted | Self::Auto)
+    }
+
+    /// True when the mode permits taking `AutoOpenDecision::Open` literally.
+    /// Manual and Assisted always require the operator, so `Open` is downgraded.
+    pub fn permits_auto_send(&self) -> bool {
+        matches!(self, Self::Auto | Self::Rehearsal)
+    }
+
+    /// Applies the mode's gating to a safety-policy decision.
+    ///
+    /// The safety policy decides what's *safe* to auto-send; the mode decides
+    /// whether the operator has *authorized* auto-send. Both must agree.
+    pub fn gate(&self, decision: AutoOpenDecision) -> AutoOpenDecision {
+        match self {
+            Self::Manual => match decision {
+                AutoOpenDecision::Ignore => AutoOpenDecision::Ignore,
+                _ => AutoOpenDecision::RequireApproval,
+            },
+            Self::Assisted => match decision {
+                AutoOpenDecision::Open => AutoOpenDecision::Prepare,
+                other => other,
+            },
+            Self::Auto | Self::Rehearsal | Self::Mock => decision,
+        }
+    }
+}
+
 /// A labeled transcript sample used to measure detector behavior.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccuracyFixture {
@@ -154,6 +267,91 @@ impl ConfidencePolicy {
     /// Live output is deliberately operator-owned by default.
     pub fn can_auto_live(&self) -> bool {
         !self.live_requires_operator
+    }
+
+    /// Applies the five architectural-vision auto-open rules to a ranked list.
+    ///
+    /// Rules enforced (in order):
+    /// 1. Score below 0.55 → `Ignore`.
+    /// 2. Score 0.55..0.75 → `RequireApproval`.
+    /// 3. Top result within 0.10 of the runner-up → `RequireApproval` (never
+    ///    auto-open when multiple candidates are close).
+    /// 4. Topic match alone (only `ThematicCoreference`) → `RequireApproval`.
+    /// 5. Semantic alone (only `SermonContextRerank` and/or `CloudEnhancement`)
+    ///    → `RequireApproval`. A quote match (`VerseQuotation`) needs at least
+    ///    one corroborating tier (semantic OR exact reference) before it can
+    ///    auto-open.
+    /// 6. Score ≥ 0.92 with at least one explicit-reference signal
+    ///    (`ExactReference`, `SpokenNumberReference`, or
+    ///    `LocalLanguageAlias`), or a quote match with corroboration, may
+    ///    `Open`. Otherwise `Prepare` for the operator.
+    ///
+    /// The caller is still responsible for honouring the operating mode
+    /// (Manual / Assisted / Auto / Rehearsal / Mock) — this method only states
+    /// what the *safety policy* permits.
+    pub fn evaluate_auto_open(&self, ranked: &[RankedCandidate]) -> AutoOpenDecision {
+        let Some(top) = ranked.first() else {
+            return AutoOpenDecision::Ignore;
+        };
+
+        let bucket = ConfidenceBucket::from_score(top.score);
+        if matches!(bucket, ConfidenceBucket::Unsafe) {
+            return AutoOpenDecision::Ignore;
+        }
+        if matches!(bucket, ConfidenceBucket::Likely) {
+            return AutoOpenDecision::RequireApproval;
+        }
+
+        // Rule 5: never auto-open when multiple candidates are close.
+        if let Some(runner_up) = ranked.get(1) {
+            if (top.score - runner_up.score).abs() < 0.10 {
+                return AutoOpenDecision::RequireApproval;
+            }
+        }
+
+        let has_explicit = top.tiers.iter().any(|tier| {
+            matches!(
+                tier,
+                DetectionTier::ExactReference
+                    | DetectionTier::SpokenNumberReference
+                    | DetectionTier::LocalLanguageAlias
+            )
+        });
+        let has_quote = top.tiers.contains(&DetectionTier::VerseQuotation);
+        let has_topic = top.tiers.contains(&DetectionTier::ThematicCoreference);
+        let has_semantic = top.tiers.iter().any(|tier| {
+            matches!(
+                tier,
+                DetectionTier::SermonContextRerank | DetectionTier::CloudEnhancement
+            )
+        });
+
+        // Rule 3: topic-only requires approval.
+        if has_topic && !has_explicit && !has_quote {
+            return AutoOpenDecision::RequireApproval;
+        }
+
+        // Rule 4: never auto-open from semantic alone.
+        if has_semantic && !has_explicit && !has_quote && !has_topic {
+            return AutoOpenDecision::RequireApproval;
+        }
+
+        // Rule 2: quote needs lexical + semantic agreement before auto-open.
+        if has_quote && !has_explicit && !has_semantic {
+            return AutoOpenDecision::RequireApproval;
+        }
+
+        // Strong (0.75..0.92) → prepare as next, operator confirms.
+        if matches!(bucket, ConfidenceBucket::Strong) {
+            return AutoOpenDecision::Prepare;
+        }
+
+        // Certain (≥0.92) and the gating rules above are satisfied.
+        if has_explicit || (has_quote && has_semantic) {
+            AutoOpenDecision::Open
+        } else {
+            AutoOpenDecision::Prepare
+        }
     }
 }
 
@@ -621,6 +819,15 @@ fn fold_for_matching(input: &str) -> String {
         .replace('’', "'")
 }
 
+pub mod books;
+pub mod calibration;
+pub mod cross_encoder;
+pub mod cross_refs;
+pub mod embeddings;
+pub mod grammar;
+pub mod normalize;
+pub mod phrase_catalog;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,7 +864,7 @@ mod tests {
             .remove(0);
         let policy = ConfidencePolicy::default();
 
-        assert_eq!(candidate.bucket, ConfidenceBucket::Ambiguous);
+        assert_eq!(candidate.bucket, ConfidenceBucket::Likely);
         assert!(!policy.can_auto_preview(&candidate));
         assert!(!policy.can_auto_live());
     }
@@ -698,6 +905,173 @@ mod tests {
         assert!(swahili.confidence >= 0.3);
         assert_eq!(spanish.code, "es");
         assert!(spanish.confidence >= 0.3);
+    }
+
+    fn ranked(reference: &str, score: f32, tiers: &[DetectionTier]) -> RankedCandidate {
+        RankedCandidate {
+            reference: reference.to_string(),
+            score,
+            tiers: tiers.to_vec(),
+        }
+    }
+
+    #[test]
+    fn auto_open_requires_explicit_or_corroborated_quote() {
+        let policy = ConfidencePolicy::default();
+
+        // Explicit reference at high confidence: Open.
+        let explicit = ranked("Psalm 23:4", 0.95, &[DetectionTier::ExactReference]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[explicit]),
+            AutoOpenDecision::Open
+        );
+
+        // Quote alone at high confidence: still requires approval.
+        let quote_only = ranked("Romans 8:28", 0.94, &[DetectionTier::VerseQuotation]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[quote_only]),
+            AutoOpenDecision::RequireApproval
+        );
+
+        // Quote + semantic agreement: Open.
+        let quote_and_semantic = ranked(
+            "Romans 8:28",
+            0.94,
+            &[
+                DetectionTier::VerseQuotation,
+                DetectionTier::SermonContextRerank,
+            ],
+        );
+        assert_eq!(
+            policy.evaluate_auto_open(&[quote_and_semantic]),
+            AutoOpenDecision::Open
+        );
+    }
+
+    #[test]
+    fn auto_open_rejects_topic_or_semantic_alone() {
+        let policy = ConfidencePolicy::default();
+
+        let topic = ranked(
+            "Matthew 25:14-30",
+            0.94,
+            &[DetectionTier::ThematicCoreference],
+        );
+        assert_eq!(
+            policy.evaluate_auto_open(&[topic]),
+            AutoOpenDecision::RequireApproval
+        );
+
+        let semantic = ranked("John 14:6", 0.95, &[DetectionTier::SermonContextRerank]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[semantic]),
+            AutoOpenDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn auto_open_blocks_when_top_two_are_close() {
+        let policy = ConfidencePolicy::default();
+        let top = ranked("John 3:16", 0.95, &[DetectionTier::ExactReference]);
+        let runner_up = ranked("John 3:36", 0.93, &[DetectionTier::ExactReference]);
+
+        assert_eq!(
+            policy.evaluate_auto_open(&[top, runner_up]),
+            AutoOpenDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn auto_open_buckets_by_score() {
+        let policy = ConfidencePolicy::default();
+
+        let strong = ranked("Psalm 23:4", 0.80, &[DetectionTier::ExactReference]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[strong]),
+            AutoOpenDecision::Prepare
+        );
+
+        let likely = ranked("Psalm 23:4", 0.60, &[DetectionTier::ExactReference]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[likely]),
+            AutoOpenDecision::RequireApproval
+        );
+
+        let unsafe_low = ranked("Psalm 23:4", 0.40, &[DetectionTier::ExactReference]);
+        assert_eq!(
+            policy.evaluate_auto_open(&[unsafe_low]),
+            AutoOpenDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn operating_mode_default_is_assisted() {
+        assert_eq!(OperatingMode::default(), OperatingMode::Assisted);
+    }
+
+    #[test]
+    fn operating_mode_round_trips_str() {
+        for mode in [
+            OperatingMode::Manual,
+            OperatingMode::Assisted,
+            OperatingMode::Auto,
+            OperatingMode::Rehearsal,
+            OperatingMode::Mock,
+        ] {
+            assert_eq!(OperatingMode::from_str(mode.as_str()), Some(mode));
+        }
+        assert_eq!(OperatingMode::from_str("garbage"), None);
+    }
+
+    #[test]
+    fn manual_mode_downgrades_every_send_to_approval() {
+        let mode = OperatingMode::Manual;
+        assert_eq!(
+            mode.gate(AutoOpenDecision::Open),
+            AutoOpenDecision::RequireApproval
+        );
+        assert_eq!(
+            mode.gate(AutoOpenDecision::Prepare),
+            AutoOpenDecision::RequireApproval
+        );
+        // Ignore stays Ignore — no point asking the operator about noise.
+        assert_eq!(
+            mode.gate(AutoOpenDecision::Ignore),
+            AutoOpenDecision::Ignore
+        );
+        assert!(!mode.permits_auto_send());
+    }
+
+    #[test]
+    fn assisted_mode_downgrades_only_open_to_prepare() {
+        let mode = OperatingMode::Assisted;
+        assert_eq!(mode.gate(AutoOpenDecision::Open), AutoOpenDecision::Prepare);
+        assert_eq!(
+            mode.gate(AutoOpenDecision::Prepare),
+            AutoOpenDecision::Prepare
+        );
+        assert_eq!(
+            mode.gate(AutoOpenDecision::RequireApproval),
+            AutoOpenDecision::RequireApproval
+        );
+        assert!(!mode.permits_auto_send());
+    }
+
+    #[test]
+    fn auto_and_rehearsal_pass_decisions_through() {
+        for mode in [OperatingMode::Auto, OperatingMode::Rehearsal] {
+            assert_eq!(mode.gate(AutoOpenDecision::Open), AutoOpenDecision::Open);
+            assert!(mode.permits_auto_send());
+        }
+    }
+
+    #[test]
+    fn rehearsal_and_mock_block_real_outputs() {
+        assert!(OperatingMode::Manual.allows_real_outputs());
+        assert!(OperatingMode::Assisted.allows_real_outputs());
+        assert!(OperatingMode::Auto.allows_real_outputs());
+        assert!(!OperatingMode::Rehearsal.allows_real_outputs());
+        assert!(!OperatingMode::Mock.allows_real_outputs());
     }
 
     #[test]

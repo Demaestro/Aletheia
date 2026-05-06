@@ -1,1 +1,1 @@
-Drop `ggml-base.en.bin` here from https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin (~142MB). It will be bundled into the installer at build time and auto-loaded at runtime. Not committed to git due to size.
+Drop `ggml-small.en.bin` here from https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin (~466 MB). It will be bundled into the installer at build time and auto-loaded at runtime. Not committed to git due to size.

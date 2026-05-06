@@ -1,5 +1,6 @@
 # check-window-visible.ps1
-# Launches via dev.mjs (Vite warmup + binary) and checks for a visible window.
+# Launches via the supported Tauri dev path and checks for a visible,
+# responding Aletheia window.
 
 Add-Type @"
 using System;
@@ -28,16 +29,36 @@ public class Win32 {
 }
 "@
 
-$root    = "C:\Users\USER\OneDrive\Desktop\worship-production-interface"
-$nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+$root    = "C:\dev\aletheia"
+$nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+if (-not $nodeExe -and (Test-Path "C:\Program Files\nodejs\node.exe")) {
+    $nodeExe = "C:\Program Files\nodejs\node.exe"
+}
+if (-not $nodeExe) {
+    Write-Host "RESULT: FAIL - node.exe not found"
+    exit 1
+}
+$nodeDir = Split-Path -Parent $nodeExe
+if ($nodeDir -and -not ($env:Path -like "*$nodeDir*")) {
+    $env:Path = "$nodeDir;$env:Path"
+}
+$systemNodeDir = "C:\Program Files\nodejs"
+if ((Test-Path $systemNodeDir) -and -not ($env:Path -like "*$systemNodeDir*")) {
+    $env:Path = "$systemNodeDir;$env:Path"
+}
 
 # Kill stale instances
 Get-Process aletheia-desktop,node -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
 
-# Launch via dev.mjs (handles Vite + warmup + binary)
-Write-Host "Starting dev.mjs launcher..."
-$launcher = Start-Process -FilePath $nodeExe -ArgumentList @("scripts/dev.mjs") `
+# Launch via npm script so this check matches the operator command.
+Write-Host "Starting Tauri dev launcher..."
+$launcher = Start-Process -FilePath $nodeExe -ArgumentList @(
+        ".\node_modules\@tauri-apps\cli\tauri.js",
+        "dev",
+        "--config",
+        "src-tauri/tauri.conf.dev.json"
+    ) `
     -WorkingDirectory $root -NoNewWindow -PassThru
 
 # Poll for visible titled window for up to 90 s
@@ -47,20 +68,23 @@ for ($i = 0; $i -lt 30; $i++) {
     $elapsed = ($i + 1) * 3
 
     $title = [Win32]::FindVisibleWindow("Aletheia")
-    $proc = Get-Process aletheia-desktop -ErrorAction SilentlyContinue
+    $proc = Get-Process aletheia-desktop -ErrorAction SilentlyContinue | Select-Object -First 1
     $ws = if ($proc) { "$([math]::Round($proc.WorkingSet/1MB,1))MB" } else { "not running" }
+    $responding = if ($proc) { $proc.Responding } else { $false }
 
-    if ($title) {
-        Write-Host "+${elapsed}s  WINDOW VISIBLE: '$title'  ($ws)"
+    if ($title -and $responding) {
+        Write-Host "+${elapsed}s  WINDOW VISIBLE + RESPONDING: '$title'  ($ws)"
         $found = $true
         break
+    } elseif ($title) {
+        Write-Host "+${elapsed}s  visible but not responding: '$title'  ($ws)"
     } else {
         Write-Host "+${elapsed}s  hidden ($ws)"
     }
 }
 
-if ($found) { Write-Host "RESULT: OK - window appeared already loaded" }
-else         { Write-Host "RESULT: FAIL - window never appeared in 90s" }
+if ($found) { Write-Host "RESULT: OK - window is visible and responding" }
+else         { Write-Host "RESULT: FAIL - window did not become visible/responding in 90s" }
 
 Get-Process aletheia-desktop,node -ErrorAction SilentlyContinue | Stop-Process -Force
-Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+if ($launcher) { Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue }

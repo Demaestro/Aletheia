@@ -14,7 +14,8 @@ export type ScreenKey =
   | "stream"
   | "songs"
   | "fleet"
-  | "clips";
+  | "clips"
+  | "bible";
 
 export type Tone = "healthy" | "degraded" | "offline" | "live" | "armed" | "neutral";
 
@@ -164,6 +165,8 @@ export type ManualSearchResult = {
   language?: string;
 };
 
+export type OperatingMode = "manual" | "assisted" | "auto" | "rehearsal" | "mock";
+
 export type DesktopRuntimeStatus = {
   mode: "tauri" | "browser-fallback";
   serviceSession: string;
@@ -171,6 +174,7 @@ export type DesktopRuntimeStatus = {
   dataMiserEnabled: boolean;
   offlineModeEnabled: boolean;
   destinationsArmed: boolean;
+  operatingMode: OperatingMode;
   auditCount: number;
   lastEventSequence: number;
   checkedAtMs: number;

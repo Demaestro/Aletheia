@@ -12,9 +12,74 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <title>Aletheia Production UI</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #020617; color: #F8FAFC; font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+      #root:empty::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at 50% 35%, #1e293b 0%, #020617 65%);
+      }
+      #boot-splash {
+        position: fixed; inset: 0;
+        display: grid; place-items: center;
+        background: radial-gradient(circle at 50% 35%, #1e293b 0%, #020617 65%);
+        z-index: 9999;
+        pointer-events: none; /* never block clicks, even before JS runs */
+        transition: opacity 240ms ease;
+      }
+      #boot-splash.hide { opacity: 0; }
+      /* CSS-only fallback: hide splash the moment React mounts anything in #root */
+      body:has(#root > *) #boot-splash { opacity: 0; }
+      #boot-splash .panel {
+        text-align: center;
+        animation: bootFade 320ms ease-out both;
+      }
+      #boot-splash .mark {
+        font-family: Outfit, Inter, system-ui, sans-serif;
+        font-weight: 700;
+        font-size: 36px;
+        letter-spacing: 0.18em;
+        color: #F8FAFC;
+        margin-bottom: 14px;
+      }
+      #boot-splash .tagline {
+        font-size: 12px; letter-spacing: 0.32em;
+        color: #94a3b8; text-transform: uppercase;
+        margin-bottom: 28px;
+      }
+      #boot-splash .ring {
+        width: 36px; height: 36px;
+        margin: 0 auto;
+        border: 2px solid rgba(148,163,184,0.18);
+        border-top-color: #38bdf8;
+        border-radius: 50%;
+        animation: bootSpin 0.9s linear infinite;
+      }
+      @keyframes bootSpin { to { transform: rotate(360deg); } }
+      @keyframes bootFade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    </style>
   </head>
-  <body class="bg-[#020617] text-[#F8FAFC]">
+  <body>
     <div id="root"></div>
+    <div id="boot-splash" aria-hidden="true">
+      <div class="panel">
+        <div class="mark">ALETHEIA</div>
+        <div class="tagline">Worship Production</div>
+        <div class="ring"></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Belt-and-suspenders splash removal: CSS `:has()` already hides it
+      // visually the moment React renders into #root. We also remove the
+      // node entirely after a short delay so it can never affect anything.
+      setTimeout(function () {
+        var splash = document.getElementById('boot-splash');
+        if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
+      }, 1500);
+    </script>
   </body>
 </html>

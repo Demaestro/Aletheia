@@ -41,10 +41,10 @@ before you have confirmed the target machine specs and microphone setup.
    ```
 
 4. **Download a Whisper model file**  
-   For English: `ggml-base.en.bin` (141 MB)
+   For English: `ggml-small.en.bin` (466 MB)
    ```
    curl -L -o whisper-base-en.bin \
-     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
    ```
    Place the file in the app's offline-assets directory (shown on the Health
    screen under "App data directory").

@@ -1,119 +1,85 @@
-/**
- * VuMeter — real-time microphone level indicator.
- *
- * Uses the Web Audio API (AnalyserNode) to show a live bar that confirms
- * audio is flowing to the STT pipeline without waiting 5+ seconds for the
- * first transcript segment. Only active while capture is running.
- */
-import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
+import { useEffect, useRef } from "react";
+import type { AudioLevel } from "../services/desktopApi";
 
 interface Props {
-  /** Pass true while start_audio_capture has succeeded. */
   active: boolean;
   deviceLabel?: string;
+  backendLevel?: AudioLevel | null;
+  compact?: boolean;
 }
 
-export function VuMeter({ active, deviceLabel }: Props) {
-  const [level, setLevel] = useState(0);          // 0-100
-  const [peak, setPeak] = useState(0);             // 0-100, sticky peak hold
-  const [clipping, setClipping] = useState(false);
-  const animRef = useRef<number>(0);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const peakTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+export function VuMeter({ active, deviceLabel, backendLevel, compact = false }: Props) {
+  const meterRef = useRef<HTMLDivElement | null>(null);
+  const valueRef = useRef<HTMLSpanElement | null>(null);
+
+  const writeMeter = (pct: number, peakPct: number, isClipping: boolean, label: string) => {
+    const safePct = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+    const safePeak = Number.isFinite(peakPct) ? Math.max(0, Math.min(100, peakPct)) : 0;
+    const root = meterRef.current;
+    if (root) {
+      root.style.setProperty("--vu-scale", String(active ? safePct / 100 : 0));
+      root.style.setProperty("--vu-peak", `${active ? safePeak : 0}%`);
+      root.style.setProperty("--vu-clip-opacity", active && safePeak > 0 ? "1" : "0");
+      root.style.setProperty(
+        "--vu-color",
+        isClipping ? "#ff4444" : safePct > 70 ? "#ffbb33" : "#22dd88",
+      );
+      root.style.setProperty("--vu-text-color", isClipping ? "#ff4444" : "#8fa");
+    }
+    if (valueRef.current) {
+      valueRef.current.textContent = label;
+    }
+  };
 
   useEffect(() => {
+    const backendFresh = backendLevel ? Date.now() - backendLevel.checkedAtMs < 4_000 : false;
     if (!active) {
-      setLevel(0);
-      setPeak(0);
-      setClipping(false);
+      writeMeter(0, 0, false, "Idle");
+      return;
+    }
+    if (!backendFresh) {
+      writeMeter(0, 0, false, "Waiting");
       return;
     }
 
-    let cancelled = false;
-
-    navigator.mediaDevices
-      .getUserMedia({ audio: true, video: false })
-      .then((stream) => {
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
-        streamRef.current = stream;
-        const ctx = new AudioContext();
-        audioCtxRef.current = ctx;
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.6;
-        source.connect(analyser);
-        analyserRef.current = analyser;
-
-        const data = new Uint8Array(analyser.frequencyBinCount);
-
-        const tick = () => {
-          if (cancelled) return;
-          analyser.getByteFrequencyData(data);
-          // RMS of frequency magnitudes → 0-100
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-          const rms = Math.sqrt(sum / data.length);
-          const pct = Math.min(100, (rms / 255) * 100 * 2.5); // boost to fill bar
-          setLevel(pct);
-          setPeak((prev) => {
-            if (pct >= prev) {
-              if (peakTimerRef.current) clearTimeout(peakTimerRef.current);
-              peakTimerRef.current = setTimeout(() => setPeak(0), 1500);
-              return pct;
-            }
-            return prev;
-          });
-          setClipping(pct >= 95);
-          animRef.current = requestAnimationFrame(tick);
-        };
-        animRef.current = requestAnimationFrame(tick);
-      })
-      .catch(() => {
-        // Permission denied or no mic — meter stays at 0, no crash.
-      });
-
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(animRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      audioCtxRef.current?.close().catch(() => undefined);
-      analyserRef.current = null;
-      streamRef.current = null;
-      audioCtxRef.current = null;
-    };
-  }, [active]);
-
-  if (!active) return null;
-
-  const barColor = clipping
-    ? "#ff4444"
-    : level > 70
-    ? "#ffbb33"
-    : "#22dd88";
+    const displayLevel = backendLevel?.level ?? 0;
+    const displayPeak = backendLevel?.peakLevel ?? 0;
+    const displayClipping = displayLevel >= 95;
+    writeMeter(
+      displayLevel,
+      displayPeak,
+      displayClipping,
+      displayClipping ? "CLIP" : backendLevel?.speechDetected ? "Signal" : `${Math.round(displayLevel)}%`,
+    );
+  }, [active, backendLevel]);
 
   return (
     <div
+      ref={meterRef}
       style={{
+        "--vu-scale": "0",
+        "--vu-peak": "0%",
+        "--vu-color": "#22dd88",
+        "--vu-text-color": "#8fa",
+        "--vu-clip-opacity": "0",
         display: "flex",
         alignItems: "center",
         gap: "10px",
-        padding: "6px 18px",
-        background: "rgba(0,0,0,0.28)",
-        borderBottom: "1px solid rgba(255,255,255,0.06)",
+        padding: compact ? "8px 10px" : "6px 18px",
+        background: compact ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.28)",
+        border: compact ? "1px solid rgba(255,255,255,0.08)" : undefined,
+        borderRadius: compact ? 6 : undefined,
         fontSize: "12px",
         color: "#8fa",
         userSelect: "none",
-      }}
+      } as CSSProperties}
       aria-label="Microphone level indicator"
     >
-      <span style={{ whiteSpace: "nowrap", minWidth: 80 }}>
-        🎙 {deviceLabel ?? "Live Mic"}
+      <span style={{ whiteSpace: "nowrap", minWidth: compact ? 48 : 80 }}>
+        Mic · {deviceLabel ?? "Default"}
       </span>
 
-      {/* bar track */}
       <div
         style={{
           position: "relative",
@@ -122,47 +88,48 @@ export function VuMeter({ active, deviceLabel }: Props) {
           borderRadius: 4,
           background: "rgba(255,255,255,0.1)",
           overflow: "visible",
-          maxWidth: 360,
+          maxWidth: compact ? 180 : 360,
         }}
       >
-        {/* fill */}
         <div
           style={{
             position: "absolute",
             left: 0,
             top: 0,
             height: "100%",
-            width: `${level}%`,
-            background: barColor,
+            width: "100%",
+            background: "var(--vu-color)",
             borderRadius: 4,
-            transition: "width 60ms linear, background 120ms",
+            transform: "scaleX(var(--vu-scale))",
+            transformOrigin: "left center",
+            transition: "transform 80ms linear, background 120ms",
           }}
         />
-        {/* peak marker */}
         <div
           style={{
             position: "absolute",
             top: -2,
-            left: `${peak}%`,
+            left: "var(--vu-peak)",
             width: 2,
             height: 12,
-            background: clipping ? "#ff4444" : "#fff",
+            background: "var(--vu-color)",
             borderRadius: 1,
             transition: "left 80ms",
-            opacity: peak > 0 ? 1 : 0,
+            opacity: "var(--vu-clip-opacity)",
           }}
         />
       </div>
 
       <span
+        ref={valueRef}
         style={{
-          minWidth: 38,
+          minWidth: compact ? 44 : 54,
           textAlign: "right",
-          color: clipping ? "#ff4444" : "#8fa",
+          color: "var(--vu-text-color)",
           fontVariantNumeric: "tabular-nums",
         }}
       >
-        {clipping ? "CLIP" : `${Math.round(level)}%`}
+        {active ? "Waiting" : "Idle"}
       </span>
     </div>
   );

@@ -92,9 +92,7 @@ impl CloudSttAdapter {
                 self.transcribe_openai(wav_bytes, hint_language, started_at)
                     .await
             }
-            CloudSttProvider::AssemblyAi => {
-                self.transcribe_assemblyai(wav_bytes, started_at).await
-            }
+            CloudSttProvider::AssemblyAi => self.transcribe_assemblyai(wav_bytes, started_at).await,
         }
     }
 

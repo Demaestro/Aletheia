@@ -48,10 +48,10 @@ pub enum CaptureError {
 pub struct CaptureConfig {
     /// Target sample rate for Whisper (16 000 Hz).
     pub target_sample_rate: u32,
-    /// How many seconds of audio to accumulate before emitting a chunk.
+    /// How many milliseconds of audio to accumulate before emitting a chunk.
     /// Shorter chunks reduce latency; longer chunks improve accuracy.
-    /// Default: 5 seconds (sub-10-second first-word latency).
-    pub chunk_duration_secs: u32,
+    /// Default: 5000 ms (sub-10-second first-word latency).
+    pub chunk_duration_ms: u32,
     /// Internal channel buffer: how many chunks can queue up before the
     /// capture loop blocks.  Default: 4.
     pub channel_capacity: usize,
@@ -63,7 +63,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             target_sample_rate: 16_000,
-            chunk_duration_secs: 5,
+            chunk_duration_ms: 5_000,
             channel_capacity: 4,
             device_name: None,
         }
@@ -71,18 +71,27 @@ impl Default for CaptureConfig {
 }
 
 /// Returns the names of all available audio input devices on this host.
+///
+/// Falls back to `default_input_device()` if full enumeration fails or returns
+/// an empty list — some Windows audio drivers (notably Intel SST) silently
+/// fail enumeration even when a usable default mic exists. This guarantees the
+/// operator's mic picker is never empty when a default device is reachable.
 pub fn list_input_devices() -> Vec<String> {
-    use cpal::traits::HostTrait;
+    use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devices) => devices
-            .filter_map(|d| {
-                use cpal::traits::DeviceTrait;
-                d.name().ok()
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+    let mut out: Vec<String> = match host.input_devices() {
+        Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
+        Err(e) => {
+            eprintln!("[aletheia-stt] input_devices enumeration failed: {e}");
+            Vec::new()
+        }
+    };
+    if let Some(default_name) = host.default_input_device().and_then(|d| d.name().ok()) {
+        if !out.iter().any(|n| n == &default_name) {
+            out.insert(0, default_name);
+        }
     }
+    out
 }
 
 /// A chunk of 16 kHz mono f32 PCM samples ready for transcription.
@@ -102,6 +111,10 @@ pub struct AudioChunk {
 pub struct AudioCapture {
     // Keeping the stream alive — drop this to stop capture.
     _stream: cpal::Stream,
+    // Keep one sender alive with the stream. Some Windows host backends can
+    // delay callback registration; without this guard the receiver can observe
+    // a disconnected channel and stop capture even though the stream opened.
+    _tx: mpsc::Sender<AudioChunk>,
 }
 
 impl AudioCapture {
@@ -137,10 +150,13 @@ impl AudioCapture {
 
         let (tx, rx) = mpsc::channel::<AudioChunk>(config.channel_capacity);
 
-        // Pre-calculate the number of (device-rate) samples that fills one
-        // chunk at the requested chunk_duration_secs.
+        // The accumulator stores 16 kHz mono samples after mixdown/resampling,
+        // so the seal threshold must use the target sample rate. Using the
+        // device rate * channel count makes a 2s chunk become ~12s on common
+        // 48 kHz stereo laptop inputs.
         let samples_per_chunk =
-            (device_sample_rate as usize) * (config.chunk_duration_secs as usize) * device_channels;
+            ((config.target_sample_rate as usize) * (config.chunk_duration_ms as usize) / 1000)
+                .max(1);
 
         // Shared accumulator — lives inside the stream callback closure.
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(
@@ -228,7 +244,13 @@ impl AudioCapture {
             .play()
             .map_err(|e| CaptureError::StreamBuild(e.to_string()))?;
 
-        Ok((Self { _stream: stream }, rx))
+        Ok((
+            Self {
+                _stream: stream,
+                _tx: tx,
+            },
+            rx,
+        ))
     }
 }
 

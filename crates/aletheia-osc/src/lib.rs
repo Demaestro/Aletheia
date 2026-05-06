@@ -315,7 +315,7 @@ fn osc_pad_string(s: &str) -> Vec<u8> {
 fn osc_pad_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
     out.push(0); // null terminator
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out
@@ -506,13 +506,25 @@ mod tests {
     #[test]
     fn loopback_always_allowed() {
         let config = OscConfig::default();
-        assert!(check_address_policy(&config, "127.0.0.1".parse().unwrap()).is_ok());
+        assert!(
+            check_address_policy(
+                &config,
+                "127.0.0.1".parse().expect("test IP literal must parse")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn private_lan_blocked_by_default() {
         let config = OscConfig::default();
-        assert!(check_address_policy(&config, "192.168.1.100".parse().unwrap()).is_err());
+        assert!(
+            check_address_policy(
+                &config,
+                "192.168.1.100".parse().expect("test IP literal must parse")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -521,7 +533,13 @@ mod tests {
             allow_private_network: true,
             ..OscConfig::default()
         };
-        assert!(check_address_policy(&config, "192.168.1.100".parse().unwrap()).is_ok());
+        assert!(
+            check_address_policy(
+                &config,
+                "192.168.1.100".parse().expect("test IP literal must parse")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -530,6 +548,12 @@ mod tests {
             allow_private_network: true,
             ..OscConfig::default()
         };
-        assert!(check_address_policy(&config, "8.8.8.8".parse().unwrap()).is_err());
+        assert!(
+            check_address_policy(
+                &config,
+                "8.8.8.8".parse().expect("test IP literal must parse")
+            )
+            .is_err()
+        );
     }
 }
