@@ -2,7 +2,24 @@
 //!
 //! Opens the default system input device using `cpal`, resamples to 16 kHz
 //! mono f32 PCM (the format Whisper expects), and accumulates samples into
-//! 30-second chunks before sending each chunk through a `tokio` channel.
+//! short overlapping chunks before sending each chunk through a `tokio` channel.
+//!
+//! ## Latency vs. accuracy tradeoff
+//!
+//! Whisper accuracy improves with longer audio context but every extra second
+//! of audio is a second of transcription lag the operator sees. The default
+//! configuration uses a sliding-window approach to balance both:
+//!
+//! - **`chunk_duration_secs = 3`** — each chunk is 3 s of audio. Whisper still
+//!   sees enough context to produce high-quality output, and end-to-end
+//!   transcription latency is ~3 s + inference (down from 5 s + inference).
+//! - **`overlap_secs = 1`** — every chunk includes the last 1 s of the
+//!   previous chunk so words spoken near a chunk boundary aren't cut in half.
+//!   The capture stride is therefore `chunk_duration_secs - overlap_secs = 2 s`
+//!   — a fresh chunk is emitted every 2 s. The consumer is responsible for
+//!   suppressing segments that fall entirely within the overlap window
+//!   (using `AudioChunk::overlap_ms`) so the same words don't appear twice
+//!   in the transcript view.
 //!
 //! # Usage
 //! ```rust,no_run
@@ -48,10 +65,15 @@ pub enum CaptureError {
 pub struct CaptureConfig {
     /// Target sample rate for Whisper (16 000 Hz).
     pub target_sample_rate: u32,
-    /// How many seconds of audio to accumulate before emitting a chunk.
-    /// Shorter chunks reduce latency; longer chunks improve accuracy.
-    /// Default: 5 seconds (sub-10-second first-word latency).
+    /// Total length of each emitted chunk, including overlap. Whisper sees
+    /// this many seconds of audio per inference call. Default: 3 seconds.
     pub chunk_duration_secs: u32,
+    /// How many seconds of the previous chunk are repeated at the start of
+    /// the next chunk. Prevents Whisper from cutting words mid-syllable at
+    /// chunk boundaries. The effective emit cadence is
+    /// `chunk_duration_secs - overlap_secs`. Default: 1 second.
+    /// Set to 0 to disable overlap entirely.
+    pub overlap_secs: u32,
     /// Internal channel buffer: how many chunks can queue up before the
     /// capture loop blocks.  Default: 4.
     pub channel_capacity: usize,
@@ -63,7 +85,8 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             target_sample_rate: 16_000,
-            chunk_duration_secs: 5,
+            chunk_duration_secs: 3,
+            overlap_secs: 1,
             channel_capacity: 4,
             device_name: None,
         }
@@ -71,18 +94,27 @@ impl Default for CaptureConfig {
 }
 
 /// Returns the names of all available audio input devices on this host.
+///
+/// Falls back to `default_input_device()` if full enumeration fails or returns
+/// an empty list — some Windows audio drivers (notably Intel SST) silently
+/// fail enumeration even when a usable default mic exists. This guarantees the
+/// operator's mic picker is never empty when a default device is reachable.
 pub fn list_input_devices() -> Vec<String> {
-    use cpal::traits::HostTrait;
+    use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devices) => devices
-            .filter_map(|d| {
-                use cpal::traits::DeviceTrait;
-                d.name().ok()
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+    let mut out: Vec<String> = match host.input_devices() {
+        Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
+        Err(e) => {
+            eprintln!("[aletheia-stt] input_devices enumeration failed: {e}");
+            Vec::new()
+        }
+    };
+    if let Some(default_name) = host.default_input_device().and_then(|d| d.name().ok()) {
+        if !out.iter().any(|n| n == &default_name) {
+            out.insert(0, default_name);
+        }
     }
+    out
 }
 
 /// A chunk of 16 kHz mono f32 PCM samples ready for transcription.
@@ -92,6 +124,12 @@ pub struct AudioChunk {
     pub samples: Vec<f32>,
     /// Wall-clock milliseconds when the chunk was sealed.
     pub sealed_at_ms: u64,
+    /// Milliseconds at the start of this chunk that overlap with the previous
+    /// chunk. Whisper segments whose `end_ms <= overlap_ms` are duplicates
+    /// of words already transcribed and should be dropped. `0` for the very
+    /// first chunk in a session (no prior chunk to overlap with) or when
+    /// overlap is disabled.
+    pub overlap_ms: u32,
 }
 
 /// Handle to a running audio capture session.
@@ -137,19 +175,41 @@ impl AudioCapture {
 
         let (tx, rx) = mpsc::channel::<AudioChunk>(config.channel_capacity);
 
-        // Pre-calculate the number of (device-rate) samples that fills one
-        // chunk at the requested chunk_duration_secs.
+        let target_rate = config.target_sample_rate;
+
+        // Buffer holds RESAMPLED MONO samples at target_rate (16 kHz), not
+        // raw device samples — so the chunk-fill threshold must be measured
+        // in target_rate samples regardless of what the device hardware does.
+        // Earlier code used `device_rate * duration * channels`, which silently
+        // multiplied the latency by `device_rate / target_rate` when those
+        // differed (e.g. a 48 kHz / 2-ch laptop mic would only emit a chunk
+        // every 30 seconds at the 5-second nominal setting). That bug masked
+        // the latency win we get from a smaller chunk duration.
         let samples_per_chunk =
-            (device_sample_rate as usize) * (config.chunk_duration_secs as usize) * device_channels;
+            (target_rate as usize).saturating_mul(config.chunk_duration_secs as usize);
+        let overlap_samples =
+            (target_rate as usize).saturating_mul(config.overlap_secs as usize);
+        // Sanity: overlap must strictly precede chunk size, otherwise nothing
+        // ever drains and the buffer grows without bound. Clamp here so a
+        // misconfiguration becomes a smaller overlap rather than a deadlock.
+        let overlap_samples = overlap_samples.min(samples_per_chunk.saturating_sub(1));
+        let stride_samples = samples_per_chunk - overlap_samples;
+        let overlap_ms = (config.overlap_secs.saturating_mul(1_000)).min(
+            (config.chunk_duration_secs.saturating_sub(1)).saturating_mul(1_000),
+        );
 
         // Shared accumulator — lives inside the stream callback closure.
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(
             samples_per_chunk + 1024,
         )));
+        // Track whether the next emitted chunk is the very first in this
+        // session. The first chunk has no prior chunk to overlap with, so its
+        // overlap_ms is reported as 0 even when overlap is configured.
+        let first_chunk = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let buffer_clone = buffer.clone();
+        let first_clone = first_chunk.clone();
         let tx_clone = tx.clone();
-        let target_rate = config.target_sample_rate;
 
         let stream = match device_config.sample_format() {
             cpal::SampleFormat::F32 => device
@@ -162,7 +222,10 @@ impl AudioCapture {
                             device_channels,
                             target_rate,
                             samples_per_chunk,
+                            stride_samples,
+                            overlap_ms,
                             &buffer_clone,
+                            &first_clone,
                             &tx_clone,
                         );
                     },
@@ -173,6 +236,7 @@ impl AudioCapture {
 
             cpal::SampleFormat::I16 => {
                 let buffer_clone2 = buffer.clone();
+                let first_clone2 = first_chunk.clone();
                 device
                     .build_input_stream(
                         &device_config.into(),
@@ -185,7 +249,10 @@ impl AudioCapture {
                                 device_channels,
                                 target_rate,
                                 samples_per_chunk,
+                                stride_samples,
+                                overlap_ms,
                                 &buffer_clone2,
+                                &first_clone2,
                                 &tx_clone,
                             );
                         },
@@ -197,6 +264,7 @@ impl AudioCapture {
 
             cpal::SampleFormat::U16 => {
                 let buffer_clone3 = buffer.clone();
+                let first_clone3 = first_chunk.clone();
                 device
                     .build_input_stream(
                         &device_config.into(),
@@ -211,7 +279,10 @@ impl AudioCapture {
                                 device_channels,
                                 target_rate,
                                 samples_per_chunk,
+                                stride_samples,
+                                overlap_ms,
                                 &buffer_clone3,
+                                &first_clone3,
                                 &tx_clone,
                             );
                         },
@@ -237,16 +308,32 @@ impl AudioCapture {
 // ---------------------------------------------------------------------------
 
 /// Converts `data` (any sample rate, any channel count) to 16 kHz mono,
-/// accumulates into `buffer`, and sends a sealed chunk when it fills up.
+/// accumulates into `buffer`, and emits sealed chunks with the configured
+/// overlap.
+///
+/// Each emitted chunk contains exactly `samples_per_chunk` samples. After
+/// emitting we drain `stride_samples` from the front of the buffer (where
+/// `stride = chunk - overlap`), so the *last* `overlap_samples` of the chunk
+/// remain in the buffer and become the *first* `overlap_samples` of the next
+/// chunk. This gives Whisper word-boundary context across chunk seams.
+#[allow(clippy::too_many_arguments)]
 fn process_samples(
     data: &[f32],
     device_rate: u32,
     channels: usize,
     target_rate: u32,
     samples_per_chunk: usize,
+    stride_samples: usize,
+    overlap_ms: u32,
     buffer: &std::sync::Mutex<Vec<f32>>,
+    first_chunk: &std::sync::atomic::AtomicBool,
     tx: &mpsc::Sender<AudioChunk>,
 ) {
+    // Defensive — should be enforced at construction.
+    if samples_per_chunk == 0 || stride_samples == 0 || channels == 0 {
+        return;
+    }
+
     // Step 1: mix down to mono.
     let mono: Vec<f32> = data
         .chunks_exact(channels)
@@ -268,10 +355,21 @@ fn process_samples(
     buf.extend_from_slice(&resampled);
 
     while buf.len() >= samples_per_chunk {
-        let chunk_samples: Vec<f32> = buf.drain(..samples_per_chunk).collect();
+        // Copy a full chunk-sized window — do NOT drain it yet, we need to
+        // retain the overlap tail in the buffer for the next chunk.
+        let chunk_samples: Vec<f32> = buf[..samples_per_chunk].to_vec();
+        // Drain only the non-overlapping prefix. The remaining
+        // `samples_per_chunk - stride_samples == overlap_samples` samples
+        // become the head of the next chunk.
+        buf.drain(..stride_samples);
+
+        let is_first = first_chunk.swap(false, std::sync::atomic::Ordering::Relaxed);
         let chunk = AudioChunk {
             samples: chunk_samples,
             sealed_at_ms: now_ms(),
+            // First chunk has no prior to overlap with — report 0 so the
+            // consumer doesn't wrongly suppress its leading segments.
+            overlap_ms: if is_first { 0 } else { overlap_ms },
         };
         // Non-blocking send: if the channel is full we discard the chunk
         // rather than blocking the audio callback thread.
@@ -335,5 +433,88 @@ mod tests {
         for (a, b) in input.iter().zip(output.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    /// First chunk reports `overlap_ms == 0` because nothing came before;
+    /// subsequent chunks carry the configured overlap so the consumer can
+    /// dedup their leading segments.
+    #[test]
+    fn first_chunk_reports_no_overlap_then_subsequent_chunks_do() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // 16 kHz, mono, samples_per_chunk = 100, stride = 60 → overlap = 40,
+        // overlap_ms = 40 * 1000 / 16_000 == 2.5 → round to 2 ms (we'll just
+        // pass the configured value through).
+        let samples_per_chunk = 100usize;
+        let stride_samples = 60usize;
+        let overlap_ms = 200u32;
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+        let first = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::channel::<AudioChunk>(8);
+
+        // Pump 220 mono samples in one shot — enough for two chunks given
+        // stride=60 (need samples_per_chunk first, then samples_per_chunk
+        // again after draining stride).
+        let data: Vec<f32> = (0..220).map(|i| (i as f32) / 220.0).collect();
+        process_samples(
+            &data,
+            16_000, // device_rate
+            1,      // channels
+            16_000, // target_rate
+            samples_per_chunk,
+            stride_samples,
+            overlap_ms,
+            &buffer,
+            &first,
+            &tx,
+        );
+
+        let chunk1 = rx.try_recv().expect("first chunk should emit");
+        assert_eq!(chunk1.samples.len(), samples_per_chunk);
+        assert_eq!(chunk1.overlap_ms, 0, "first chunk has no prior to overlap with");
+
+        let chunk2 = rx.try_recv().expect("second chunk should emit");
+        assert_eq!(chunk2.samples.len(), samples_per_chunk);
+        assert_eq!(
+            chunk2.overlap_ms, overlap_ms,
+            "subsequent chunks carry the configured overlap"
+        );
+
+        // Assert the overlap REGION matches: chunk2's first
+        // `samples_per_chunk - stride_samples` samples should equal chunk1's
+        // tail. This is the actual word-boundary continuity guarantee.
+        let overlap_samples = samples_per_chunk - stride_samples;
+        let chunk1_tail = &chunk1.samples[chunk1.samples.len() - overlap_samples..];
+        let chunk2_head = &chunk2.samples[..overlap_samples];
+        for (a, b) in chunk1_tail.iter().zip(chunk2_head.iter()) {
+            assert!((a - b).abs() < 1e-6, "overlap region must be byte-identical");
+        }
+    }
+
+    /// With `overlap_secs == 0` the buffer drains a full chunk each time and
+    /// no samples are repeated — degenerate sliding window.
+    #[test]
+    fn zero_overlap_falls_back_to_non_overlapping_chunks() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let samples_per_chunk = 50usize;
+        let stride_samples = 50usize; // == samples_per_chunk
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+        let first = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::channel::<AudioChunk>(8);
+
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        process_samples(
+            &data, 16_000, 1, 16_000, samples_per_chunk, stride_samples, 0, &buffer, &first, &tx,
+        );
+
+        let c1 = rx.try_recv().unwrap();
+        let c2 = rx.try_recv().unwrap();
+        // Disjoint — chunk2's head is a fresh sample, not chunk1's tail.
+        assert!((c1.samples.last().unwrap() - c2.samples[0]).abs() > 0.5);
+        assert_eq!(c1.overlap_ms, 0);
+        assert_eq!(c2.overlap_ms, 0);
     }
 }

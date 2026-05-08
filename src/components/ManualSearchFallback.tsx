@@ -6,9 +6,12 @@ import { ActionButton, SectionHeader, StatusPill } from "./Primitives";
 import {
   listBibleTranslations,
   importBibleTranslation,
+  deleteBibleTranslation,
   fetchVerseFromApiBible,
   type BibleTranslationStatus
 } from "../services/desktopApi";
+
+const BUNDLED_TRANSLATION_IDS = new Set(["kjv", "bbe"]);
 
 const TRANSLATIONS = ["All", "KJV", "NIV", "ESV", "NKJV", "NLT", "AMP"];
 
@@ -32,6 +35,7 @@ export function ManualSearchFallback({
   const [importPaths, setImportPaths] = useState<Record<string, string>>({});
   const [importingId, setImportingId] = useState<string | null>(null);
   const [importMessage, setImportMessage] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   // On-demand fetched verse bodies (for references missing from local DB)
   const [fetchedBodies, setFetchedBodies] = useState<Record<string, string>>({});
   const [fetchingRef, setFetchingRef] = useState<string | null>(null);
@@ -78,6 +82,26 @@ export function ManualSearchFallback({
     const status = translations.find((t) => t.id === meta.id);
     return { ...meta, status };
   });
+
+  const handleDelete = async (id: string, name: string) => {
+    if (BUNDLED_TRANSLATION_IDS.has(id)) return;
+    if (typeof window !== "undefined" && !window.confirm(
+      `Delete all loaded verses for ${name}? You can re-import the JSON file afterwards.`
+    )) {
+      return;
+    }
+    setDeletingId(id);
+    setImportMessage(null);
+    try {
+      const removed = await deleteBibleTranslation(id);
+      setImportMessage(`Removed ${removed.toLocaleString()} verses for ${name}.`);
+      await refreshTranslations();
+    } catch (err) {
+      setImportMessage(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const handleImport = async (id: string, name: string, license: string) => {
     const path = (importPaths[id] ?? "").trim();
@@ -257,6 +281,17 @@ export function ManualSearchFallback({
                           disabled={importingId === row.id}
                         >
                           {importingId === row.id ? "Importing…" : "Import"}
+                        </ActionButton>
+                      </div>
+                    )}
+                    {loaded > 0 && !BUNDLED_TRANSLATION_IDS.has(row.id) && (
+                      <div className="mt-2 flex justify-end">
+                        <ActionButton
+                          tone="danger"
+                          onClick={() => void handleDelete(row.id, row.name)}
+                          disabled={deletingId === row.id}
+                        >
+                          {deletingId === row.id ? "Deleting…" : "Delete"}
                         </ActionButton>
                       </div>
                     )}

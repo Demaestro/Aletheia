@@ -18,13 +18,41 @@
  */
 
 import { spawn, execFileSync }       from "node:child_process";
-import { resolve, dirname }          from "node:path";
+import { resolve, dirname, join }    from "node:path";
 import { fileURLToPath }             from "node:url";
 import { existsSync, statSync, readdirSync } from "node:fs";
+import { homedir }                   from "node:os";
 
 const __dir   = dirname(fileURLToPath(import.meta.url));
 const root    = resolve(__dir, "..");
-const BINARY  = "C:\\Users\\USER\\cargo-targets\\worship-production-interface\\debug\\aletheia-desktop.exe";
+
+// Resolve binary path from (in priority order):
+//   1. ALETHEIA_BINARY env var (explicit override)
+//   2. CARGO_TARGET_DIR/debug/aletheia-desktop.exe
+//   3. ~/cargo-targets/worship-production-interface/debug/aletheia-desktop.exe (default)
+//   4. <repo>/src-tauri/target/debug/aletheia-desktop.exe (cargo default)
+function resolveBinary() {
+  const exeName = process.platform === "win32" ? "aletheia-desktop.exe" : "aletheia-desktop";
+  const candidates = [];
+  if (process.env.ALETHEIA_BINARY) candidates.push(process.env.ALETHEIA_BINARY);
+  if (process.env.CARGO_TARGET_DIR) {
+    candidates.push(join(process.env.CARGO_TARGET_DIR, "debug", exeName));
+  }
+  candidates.push(
+    join(homedir(), "cargo-targets", "worship-production-interface", "debug", exeName)
+  );
+  candidates.push(join(root, "src-tauri", "target", "debug", exeName));
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  process.stderr.write(
+    `Aletheia binary not found. Looked in:\n  - ${candidates.join("\n  - ")}\n` +
+      `Set ALETHEIA_BINARY or run \`cargo build -p aletheia-desktop\` first.\n`
+  );
+  process.exit(1);
+}
+
+const BINARY  = resolveBinary();
 const PORT    = "5178";
 
 // ── 1. Staleness check ────────────────────────────────────────────────────

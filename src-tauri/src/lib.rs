@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use aletheia_core::{ServiceSessionId, now_ms};
 use aletheia_detection::{
-    AccuracyFixture, KeywordLanguageDetector, LanguageDetector, ReferenceKeywordDetector,
-    ScriptureDetector, SupportedLanguage, TranscriptSegment as DetectionTranscriptSegment,
-    evaluate_accuracy_fixtures,
+    AccuracyFixture, GrammarScriptureDetector, KeywordLanguageDetector, LanguageDetector,
+    ReferenceKeywordDetector, ScriptureDetector, SupportedLanguage,
+    TranscriptSegment as DetectionTranscriptSegment, evaluate_accuracy_fixtures,
 };
 use aletheia_easyworship::EasyWorshipAdapter;
 use aletheia_obs::ObsAdapter;
@@ -41,6 +41,7 @@ pub mod ccli;
 pub mod fleet;
 pub mod stream_server;
 pub mod kv;
+pub mod scripture_search;
 
 use crate::commands::*;
 use crate::dto::*;
@@ -65,8 +66,8 @@ pub struct DesktopState {
     osc: Mutex<OscAdapter>,
     easyworship: Mutex<EasyWorshipAdapter>,
     database_path: PathBuf,
-    /// Loaded Whisper model — shared with the background transcription task.
-    stt_adapter: Arc<Mutex<Option<OfflineSttAdapter>>>,
+    /// Loaded Whisper model â€” shared with the background transcription task.
+    stt_adapter: Arc<Mutex<Option<Arc<OfflineSttAdapter>>>>,
     /// Dropping the SyncSender signals the capture thread to stop the stream.
     /// cpal::Stream is !Send on Windows, so AudioCapture lives on its own
     /// dedicated std::thread rather than in this shared state struct.
@@ -76,7 +77,12 @@ pub struct DesktopState {
     /// services. Populated by the STT inference task in start_audio_capture and
     /// consumed by get_service_state and analyze_transcript.
     live_transcript: Arc<Mutex<std::collections::VecDeque<TranscriptSegmentDto>>>,
-    /// CCLI usage cache — hydrated on demand from the audit log.
+    /// Currently open service_sessions row id. Populated by
+    /// [`ensure_active_session`] whenever a persistence-bound path needs one
+    /// (transcript segment insert, candidate insert, operator action,
+    /// display event). Reset on `end_service_session`.
+    active_session_id: Arc<Mutex<Option<String>>>,
+    /// CCLI usage cache â€” hydrated on demand from the audit log.
     pub ccli_usage: CcliUsageCache,
     /// Local HTTP server for the stream overlay browser source.
     pub stream_overlay: StreamOverlayServer,
@@ -84,8 +90,26 @@ pub struct DesktopState {
 
 const LIVE_TRANSCRIPT_CAPACITY: usize = 50;
 
+/// Derives a `YYYY-MM-DD` UTC date string from a unix-epoch millisecond
+/// timestamp without pulling in chrono. Uses Fliegel & Van Flandern (1968).
+pub fn date_from_unix_ms(unix_ms: u64) -> String {
+    let total_days = (unix_ms / 1000) / 86_400;
+    let days = total_days as u32;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Format a unix-ms timestamp as a `HH:MM:SS` UTC clock string for display in
-/// the live transcript view. We deliberately avoid pulling in chrono — std is
+/// the live transcript view. We deliberately avoid pulling in chrono â€” std is
 /// enough for a wall-clock readout and keeps the binary small.
 fn format_clock_time(unix_ms: u64) -> String {
     let seconds_of_day = (unix_ms / 1000) % 86_400;
@@ -121,53 +145,23 @@ fn chrono_lite_now() -> String {
 }
 
 fn default_runtime_state() -> RuntimeState {
-    let candidates = production_candidates();
+    // Operator-safe defaults:
+    //   * preview / live start EMPTY — no demo verses on the program bus.
+    //   * destinations DISARMED — sending live to vMix/OBS/etc. requires an
+    //     explicit operator gesture.
+    // Architecture vision: "wrong scripture is worse than no scripture."
+    // Pre-arming and pre-loading demo data violated both rules: the operator
+    // could open the app, hit "Send live", and ship a demo verse to a real
+    // congregation. The only safe initial state is silence.
     RuntimeState {
-        preview: candidates[0].clone(),
-        live: candidates[2].clone(),
-        destinations_armed: true,
+        preview: ScriptureCandidateDto::default(),
+        live: ScriptureCandidateDto::default(),
+        destinations_armed: false,
         data_miser_enabled: true,
         offline_mode_enabled: true,
         operator_name: default_operator_name(),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/// Serialised row from the `trusted_plugins` registry (v6).
-
-/// Aggregated calibration accuracy report (v6).
-
 
 impl DesktopState {
     fn open(database_path: impl AsRef<Path>) -> Result<Self, String> {
@@ -205,7 +199,7 @@ impl DesktopState {
         let runtime = match store.load_runtime_state().ok().flatten() {
             Some(json) => {
                 serde_json::from_str::<RuntimeState>(&json).unwrap_or_else(|_| {
-                    log::warn!("[session] saved state is invalid — starting fresh");
+                    log::warn!("[session] saved state is invalid â€” starting fresh");
                     default_runtime_state()
                 })
             }
@@ -217,7 +211,7 @@ impl DesktopState {
         // Pre-load the Whisper STT model in a background thread so it is
         // ready the moment the operator opens the Transcript screen.
         // The 142 MB ggml file typically loads in 1-2 s on an SSD.
-        let stt_adapter: Arc<Mutex<Option<OfflineSttAdapter>>> = Arc::new(Mutex::new(None));
+        let stt_adapter: Arc<Mutex<Option<Arc<OfflineSttAdapter>>>> = Arc::new(Mutex::new(None));
         {
             let stt_bg  = stt_adapter.clone();
             let root_bg = asset_root.clone();
@@ -226,7 +220,7 @@ impl DesktopState {
                     Ok(path) => match OfflineSttAdapter::load(&path) {
                         Ok(adapter) => {
                             if let Ok(mut g) = stt_bg.lock() {
-                                *g = Some(adapter);
+                                *g = Some(Arc::new(adapter));
                             }
                             log::info!("[stt] auto-loaded model: {}", path.display());
                         }
@@ -252,9 +246,68 @@ impl DesktopState {
             live_transcript: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
                 LIVE_TRANSCRIPT_CAPACITY,
             ))),
+            active_session_id: Arc::new(Mutex::new(None)),
             ccli_usage: CcliUsageCache::default(),
             stream_overlay: StreamOverlayServer::default(),
         })
+    }
+
+    /// Returns a stable `service-YYYY-MM-DD` id for today, creating the
+    /// row on first call. Subsequent calls in the same process reuse the
+    /// cached id. Thread-safe.
+    ///
+    /// Called from every path that persists to a session-scoped table.
+    pub fn ensure_active_session(&self) -> Result<String, String> {
+        {
+            let guard = self.active_session_id.lock()
+                .map_err(|_| "session lock unavailable".to_string())?;
+            if let Some(id) = guard.clone() {
+                return Ok(id);
+            }
+        }
+        // Derive deterministic id from today's UTC date and upsert the row.
+        let now = aletheia_core::now_ms();
+        let session_date = date_from_unix_ms(now);
+        let id = format!("service-{session_date}");
+        let name = format!("Service â€” {session_date}");
+        let runtime = self.lock_runtime()?.clone();
+        let store = self.lock_store()?;
+        store.upsert_service_session(&aletheia_store::ServiceSessionRecord {
+            id: id.clone(),
+            name,
+            started_at_ms: now,
+            ended_at_ms: None,
+            data_miser_enabled: runtime.data_miser_enabled,
+            offline_mode_enabled: runtime.offline_mode_enabled,
+        }).map_err(|e| e.to_string())?;
+        drop(store);
+        let mut guard = self.active_session_id.lock()
+            .map_err(|_| "session lock unavailable".to_string())?;
+        *guard = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Read-only peek at the currently cached active session id. Does not
+    /// create a session row. Returns `None` when no session has been opened
+    /// yet in this process.
+    pub fn active_session_id_snapshot(&self) -> Result<Option<String>, String> {
+        let guard = self.active_session_id.lock()
+            .map_err(|_| "session lock unavailable".to_string())?;
+        Ok(guard.clone())
+    }
+
+    /// Marks the active session ended and clears the cached id.
+    pub fn end_active_session(&self) -> Result<Option<String>, String> {
+        let mut guard = self.active_session_id.lock()
+            .map_err(|_| "session lock unavailable".to_string())?;
+        let id = match guard.take() {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let store = self.lock_store()?;
+        store.end_service_session(&id, aletheia_core::now_ms())
+            .map_err(|e| e.to_string())?;
+        Ok(Some(id))
     }
 
     /// Return a snapshot of the live transcript ring buffer (newest-first).
@@ -273,6 +326,15 @@ impl DesktopState {
             .connection()
             .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
             .map_err(|error| error.to_string())
+    }
+
+    /// Returns the directory housing the SQLite database — used as the
+    /// app-data dir for sidecar files like `scripture_health.json`.
+    pub fn app_data_dir(&self) -> Result<PathBuf, String> {
+        self.database_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "database path has no parent directory".to_string())
     }
 
     pub fn lock_store(&self) -> Result<std::sync::MutexGuard<'_, AletheiaStore>, String> {
@@ -559,18 +621,6 @@ pub fn output_health_to_state_detail(health: OutputHealth) -> (String, String) {
     }
 }
 
-
-/// Append an audit event using an already-acquired store handle.
-///
-/// CRITICAL: This function does NOT lock `state.store` itself — the caller
-/// must already hold the store mutex (or be in a context where re-locking
-/// would deadlock). `std::sync::Mutex` on Windows is NOT reentrant, so any
-/// command that already called `state.lock_store()?` MUST pass that handle
-/// directly to this function instead of calling `record_audit_state`.
-
-/// Convenience wrapper for callers that do NOT already hold the store lock.
-/// Acquires the lock, calls `record_audit`, and releases. Safe to call only
-/// from contexts where the store mutex is currently free.
 
 pub fn write_booth_pack_file(
     root: &Path,
@@ -950,7 +1000,7 @@ fn seed_scripture_library(store: &AletheiaStore) -> Result<(), String> {
 /// Seeds the additional English translations the operator can pick from in the
 /// scripture panel: NKJV, NIV, NLT, MSG (The Message), and WEB (World English
 /// Bible). NKJV/NIV/NLT/MSG carry publisher copyrights, so only a curated set
-/// of high-frequency preaching references is bundled — operators are expected
+/// of high-frequency preaching references is bundled â€” operators are expected
 /// to honour their own publisher licence agreements when pushing live. WEB is
 /// public-domain and ships with the same coverage as KJV's most-used set.
 fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
@@ -1032,7 +1082,7 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("niv", "Joshua", 1, 9, "Have I not commanded you? Be strong and courageous. Do not be afraid; do not be discouraged, for the Lord your God will be with you wherever you go."),
         ("niv", "Psalm", 23, 1, "The Lord is my shepherd, I lack nothing."),
         ("niv", "Psalm", 23, 4, "Even though I walk through the darkest valley, I will fear no evil, for you are with me; your rod and your staff, they comfort me."),
-        ("niv", "Psalm", 27, 1, "The Lord is my light and my salvation— whom shall I fear? The Lord is the stronghold of my life— of whom shall I be afraid?"),
+        ("niv", "Psalm", 27, 1, "The Lord is my light and my salvationâ€” whom shall I fear? The Lord is the stronghold of my lifeâ€” of whom shall I be afraid?"),
         ("niv", "Psalm", 46, 1, "God is our refuge and strength, an ever-present help in trouble."),
         ("niv", "Psalm", 46, 10, "He says, 'Be still, and know that I am God; I will be exalted among the nations, I will be exalted in the earth.'"),
         ("niv", "Psalm", 91, 1, "Whoever dwells in the shelter of the Most High will rest in the shadow of the Almighty."),
@@ -1063,7 +1113,7 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("niv", "Romans", 12, 2, "Do not conform to the pattern of this world, but be transformed by the renewing of your mind."),
         ("niv", "2 Corinthians", 5, 17, "Therefore, if anyone is in Christ, the new creation has come: The old has gone, the new is here!"),
         ("niv", "Galatians", 2, 20, "I have been crucified with Christ and I no longer live, but Christ lives in me. The life I now live in the body, I live by faith in the Son of God, who loved me and gave himself for me."),
-        ("niv", "Ephesians", 2, 8, "For it is by grace you have been saved, through faith—and this is not from yourselves, it is the gift of God—"),
+        ("niv", "Ephesians", 2, 8, "For it is by grace you have been saved, through faithâ€”and this is not from yourselves, it is the gift of Godâ€”"),
         ("niv", "Ephesians", 6, 10, "Finally, be strong in the Lord and in his mighty power."),
         ("niv", "Philippians", 4, 6, "Do not be anxious about anything, but in every situation, by prayer and petition, with thanksgiving, present your requests to God."),
         ("niv", "Philippians", 4, 7, "And the peace of God, which transcends all understanding, will guard your hearts and your minds in Christ Jesus."),
@@ -1080,10 +1130,10 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
 
         // ---------- NLT ----------
         ("nlt", "Genesis", 1, 1, "In the beginning God created the heavens and the earth."),
-        ("nlt", "Joshua", 1, 9, "This is my command—be strong and courageous! Do not be afraid or discouraged. For the Lord your God is with you wherever you go."),
+        ("nlt", "Joshua", 1, 9, "This is my commandâ€”be strong and courageous! Do not be afraid or discouraged. For the Lord your God is with you wherever you go."),
         ("nlt", "Psalm", 23, 1, "The Lord is my shepherd; I have all that I need."),
         ("nlt", "Psalm", 23, 4, "Even when I walk through the darkest valley, I will not be afraid, for you are close beside me. Your rod and your staff protect and comfort me."),
-        ("nlt", "Psalm", 27, 1, "The Lord is my light and my salvation—so why should I be afraid? The Lord is my fortress, protecting me from danger, so why should I tremble?"),
+        ("nlt", "Psalm", 27, 1, "The Lord is my light and my salvationâ€”so why should I be afraid? The Lord is my fortress, protecting me from danger, so why should I tremble?"),
         ("nlt", "Psalm", 46, 1, "God is our refuge and strength, always ready to help in times of trouble."),
         ("nlt", "Psalm", 46, 10, "Be still, and know that I am God! I will be honored by every nation. I will be honored throughout the world."),
         ("nlt", "Psalm", 91, 1, "Those who live in the shelter of the Most High will find rest in the shadow of the Almighty."),
@@ -1105,7 +1155,7 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("nlt", "John", 3, 16, "For this is how God loved the world: He gave his one and only Son, so that everyone who believes in him will not perish but have eternal life."),
         ("nlt", "John", 10, 10, "The thief's purpose is to steal and kill and destroy. My purpose is to give them a rich and satisfying life."),
         ("nlt", "John", 14, 6, "Jesus told him, 'I am the way, the truth, and the life. No one can come to the Father except through me.'"),
-        ("nlt", "John", 14, 27, "I am leaving you with a gift—peace of mind and heart. And the peace I give is a gift the world cannot give. So don't be troubled or afraid."),
+        ("nlt", "John", 14, 27, "I am leaving you with a giftâ€”peace of mind and heart. And the peace I give is a gift the world cannot give. So don't be troubled or afraid."),
         ("nlt", "John", 16, 33, "I have told you all this so that you may have peace in me. Here on earth you will have many trials and sorrows. But take heart, because I have overcome the world."),
         ("nlt", "Romans", 8, 28, "And we know that God causes everything to work together for the good of those who love God and are called according to his purpose for them."),
         ("nlt", "Romans", 8, 31, "What shall we say about such wonderful things as these? If God is for us, who can ever be against us?"),
@@ -1130,7 +1180,7 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("nlt", "Revelation", 3, 20, "Look! I stand at the door and knock. If you hear my voice and open the door, I will come in, and we will share a meal together as friends."),
 
         // ---------- MSG (The Message) ----------
-        ("msg", "Genesis", 1, 1, "First this: God created the Heavens and Earth—all you see, all you don't see."),
+        ("msg", "Genesis", 1, 1, "First this: God created the Heavens and Earthâ€”all you see, all you don't see."),
         ("msg", "Joshua", 1, 9, "Haven't I commanded you? Strength! Courage! Don't be timid; don't get discouraged. God, your God, is with you every step you take."),
         ("msg", "Psalm", 23, 1, "God, my shepherd! I don't need a thing."),
         ("msg", "Psalm", 23, 4, "Even when the way goes through Death Valley, I'm not afraid when you walk at my side. Your trusty shepherd's crook makes me feel secure."),
@@ -1141,13 +1191,13 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("msg", "Proverbs", 3, 6, "Listen for God's voice in everything you do, everywhere you go; he's the one who will keep you on track."),
         ("msg", "Isaiah", 40, 31, "But those who wait upon God get fresh strength. They spread their wings and soar like eagles, they run and don't get tired, they walk and don't lag behind."),
         ("msg", "Isaiah", 41, 10, "Don't panic. I'm with you. There's no need to fear for I'm your God. I'll give you strength. I'll help you. I'll hold you steady, keep a firm grip on you."),
-        ("msg", "Jeremiah", 29, 11, "I know what I'm doing. I have it all planned out—plans to take care of you, not abandon you, plans to give you the future you hope for."),
+        ("msg", "Jeremiah", 29, 11, "I know what I'm doing. I have it all planned outâ€”plans to take care of you, not abandon you, plans to give you the future you hope for."),
         ("msg", "Matthew", 6, 33, "Steep your life in God-reality, God-initiative, God-provisions. Don't worry about missing out. You'll find all your everyday human concerns will be met."),
         ("msg", "Matthew", 11, 28, "Are you tired? Worn out? Burned out on religion? Come to me. Get away with me and you'll recover your life. I'll show you how to take a real rest."),
         ("msg", "John", 3, 16, "This is how much God loved the world: He gave his Son, his one and only Son. And this is why: so that no one need be destroyed; by believing in him, anyone can have a whole and lasting life."),
         ("msg", "John", 10, 10, "A thief is only there to steal and kill and destroy. I came so they can have real and eternal life, more and better life than they ever dreamed of."),
         ("msg", "John", 14, 6, "Jesus said, 'I am the Road, also the Truth, also the Life. No one gets to the Father apart from me.'"),
-        ("msg", "John", 14, 27, "I'm leaving you well and whole. That's my parting gift to you. Peace. I don't leave you the way you're used to being left—feeling abandoned, bereft. So don't be upset. Don't be distraught."),
+        ("msg", "John", 14, 27, "I'm leaving you well and whole. That's my parting gift to you. Peace. I don't leave you the way you're used to being leftâ€”feeling abandoned, bereft. So don't be upset. Don't be distraught."),
         ("msg", "Romans", 8, 28, "That's why we can be so sure that every detail in our lives of love for God is worked into something good."),
         ("msg", "Romans", 8, 31, "So, what do you think? With God on our side like this, how can we lose?"),
         ("msg", "Romans", 12, 2, "Don't become so well-adjusted to your culture that you fit into it without even thinking. Instead, fix your attention on God. You'll be changed from the inside out."),
@@ -1159,14 +1209,14 @@ fn seed_extra_translations(store: &AletheiaStore) -> Result<(), String> {
         ("msg", "Philippians", 4, 19, "You can be sure that God will take care of everything you need, his generosity exceeding even yours in the glory that pours from Jesus."),
         ("msg", "Hebrews", 11, 1, "The fundamental fact of existence is that this trust in God, this faith, is the firm foundation under everything that makes life worth living."),
         ("msg", "Hebrews", 13, 5, "Don't be obsessed with getting more material things. Be relaxed with what you have. Since God assured us, 'I'll never let you down, never walk off and leave you.'"),
-        ("msg", "Hebrews", 13, 8, "For Jesus doesn't change—yesterday, today, tomorrow, he's always totally himself."),
+        ("msg", "Hebrews", 13, 8, "For Jesus doesn't changeâ€”yesterday, today, tomorrow, he's always totally himself."),
         ("msg", "James", 1, 2, "Consider it a sheer gift, friends, when tests and challenges come at you from all sides."),
         ("msg", "1 Peter", 5, 7, "Live carefree before God; he is most careful with you."),
-        ("msg", "1 John", 1, 9, "On the other hand, if we admit our sins—make a clean breast of them—he won't let us down; he'll be true to himself. He'll forgive our sins and purge us of all wrongdoing."),
-        ("msg", "1 John", 4, 8, "The person who refuses to love doesn't know the first thing about God, because God is love—so you can't know him if you don't love."),
+        ("msg", "1 John", 1, 9, "On the other hand, if we admit our sinsâ€”make a clean breast of themâ€”he won't let us down; he'll be true to himself. He'll forgive our sins and purge us of all wrongdoing."),
+        ("msg", "1 John", 4, 8, "The person who refuses to love doesn't know the first thing about God, because God is loveâ€”so you can't know him if you don't love."),
         ("msg", "Revelation", 3, 20, "Look at me. I stand at the door. I knock. If you hear me call and open the door, I'll come right in and sit down to supper with you."),
 
-        // ---------- WEB (World English Bible — public domain) ----------
+        // ---------- WEB (World English Bible â€” public domain) ----------
         ("web", "Genesis", 1, 1, "In the beginning, God created the heavens and the earth."),
         ("web", "Joshua", 1, 9, "Haven't I commanded you? Be strong and courageous. Don't be afraid. Don't be dismayed, for Yahweh your God is with you wherever you go."),
         ("web", "Psalm", 23, 1, "Yahweh is my shepherd: I shall lack nothing."),
@@ -1227,10 +1277,10 @@ struct BundledBibleBook {
     chapters: Vec<Vec<String>>,
 }
 
-/// Imports a full Bible from a JSON file matching the thiagobodruk schema —
+/// Imports a full Bible from a JSON file matching the thiagobodruk schema â€”
 /// `[{"name":"Genesis","abbrev":"gn","chapters":[["v1","v2",...],...]}, ...]`.
-/// Wraps the entire insert in a single transaction for ~50× speedup over
-/// per-row autocommit (4.5 MB file → ~31k inserts in ~2–4 s).
+/// Wraps the entire insert in a single transaction for ~50Ã— speedup over
+/// per-row autocommit (4.5 MB file â†’ ~31k inserts in ~2â€“4 s).
 ///
 /// Returns the number of verses inserted.
 pub fn import_full_bible_from_json(
@@ -1387,6 +1437,69 @@ fn canonical_book_name(abbrev: &str) -> String {
     .to_string()
 }
 
+/// Computes a stable hash of every `*.json` file in the bundled bibles dir,
+/// based on `(filename, size_bytes, mtime_ms)`. Used as a re-import sentinel
+/// so cold starts skip the 31k-row UPSERT loop unless bundled content changed.
+fn bibles_resource_signature(bibles_dir: &Path) -> String {
+    use std::io::Read;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<_> = std::fs::read_dir(bibles_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if !name_str.ends_with(".json") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        name_str.hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                d.as_millis().hash(&mut hasher);
+            }
+        }
+        // Include first 4 KiB of file so genuinely-different content with
+        // identical size+mtime still invalidates the sentinel.
+        if let Ok(mut f) = std::fs::File::open(entry.path()) {
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = f.read(&mut buf) {
+                buf[..n].hash(&mut hasher);
+            }
+        }
+    }
+    format!("{:x}", hasher.finish())
+}
+
+/// Returns true if the bibles sentinel is missing or stale relative to the
+/// bundled-resource signature (or if the resources dir doesn't exist — first
+/// install).
+pub fn bibles_import_needed(bibles_dir: &Path, sentinel_path: &Path) -> bool {
+    if !bibles_dir.exists() {
+        // No bundled bibles in this build — nothing to import, also nothing
+        // to gate. Returning false here avoids an empty-import warning.
+        return false;
+    }
+    let current = bibles_resource_signature(bibles_dir);
+    match std::fs::read_to_string(sentinel_path) {
+        Ok(prior) => prior.trim() != current.trim(),
+        Err(_) => true,
+    }
+}
+
+/// Writes the current bundled-resource signature to the sentinel file so
+/// subsequent boots can skip re-import.
+pub fn write_bibles_sentinel(bibles_dir: &Path, sentinel_path: &Path) -> std::io::Result<()> {
+    let sig = bibles_resource_signature(bibles_dir);
+    std::fs::write(sentinel_path, sig)
+}
+
 /// Looks for bundled full-Bible JSON files in the Tauri resources folder and
 /// imports any translation whose verse count is below the full-canon threshold
 /// (~31 000). Run on a background thread so cold start doesn't block the UI.
@@ -1401,21 +1514,60 @@ pub fn import_bundled_bibles(store: &AletheiaStore, resources_dir: &Path) {
             "bbe-full.json",
         ),
     ];
+    // Build a list of candidate roots to look in. In a packaged build the
+    // Tauri `resource_dir()` returns the bundled resources folder. In a
+    // `cargo run` / direct-launch dev build the resources are NOT copied
+    // anywhere â€” they live in the workspace at `src-tauri/resources/`. We
+    // try each candidate so a developer launching the exe directly still
+    // gets the full Bible imported on first run.
+    let mut candidates: Vec<PathBuf> = vec![resources_dir.to_path_buf()];
+    if let Ok(exe) = std::env::current_exe() {
+        // exe usually at <ws>/src-tauri/target/<profile>/aletheia-desktop.exe
+        // workspace = exe.parent (debug) -> parent (target) -> parent (src-tauri) -> parent (workspace)
+        if let Some(profile_dir) = exe.parent() {
+            candidates.push(profile_dir.to_path_buf()); // <profile>/
+            if let Some(target_dir) = profile_dir.parent() {
+                if let Some(src_tauri) = target_dir.parent() {
+                    candidates.push(src_tauri.join("resources")); // src-tauri/resources
+                    if let Some(ws) = src_tauri.parent() {
+                        candidates.push(ws.join("src-tauri").join("resources"));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("src-tauri").join("resources"));
+        candidates.push(cwd.join("resources"));
+    }
+
     for (id, name, license, filename) in bundles {
         let count = store.count_verses_for_translation(id).unwrap_or(0);
         if count >= FULL_BIBLE_VERSE_THRESHOLD {
+            log::info!("[bible-import] {id}: already has {count} verses, skipping");
             continue;
         }
-        let path = resources_dir.join("bibles").join(filename);
-        if !path.exists() {
-            log::warn!(
-                "[bible-import] bundled file missing: {} (verse count was {count})",
-                path.display()
-            );
-            continue;
+        let mut found: Option<PathBuf> = None;
+        for root in &candidates {
+            let p = root.join("bibles").join(filename);
+            if p.exists() {
+                found = Some(p);
+                break;
+            }
         }
+        let path = match found {
+            Some(p) => p,
+            None => {
+                log::error!(
+                    "[bible-import] bundled file `{filename}` not found under any of: {:?}",
+                    candidates.iter().map(|c| c.join("bibles").join(filename)).collect::<Vec<_>>()
+                );
+                continue;
+            }
+        };
+        log::info!("[bible-import] {id}: importing from {}", path.display());
         match import_full_bible_from_json(store, id, name, license, &path) {
-            Ok(n) => log::info!("[bible-import] {id}: {n} verses imported"),
+            Ok(n) => log::info!("[bible-import] {id}: {n} verses imported OK"),
             Err(error) => log::error!("[bible-import] {id} failed: {error}"),
         }
     }
@@ -1439,7 +1591,7 @@ fn seed_offline_assets(store: &AletheiaStore) -> Result<(), String> {
 }
 
 /// Returns the current service session ID string based on today's UTC date.
-/// Format: `"service-YYYY-MM-DD"` — matches the pattern used in `get_service_state`.
+/// Format: `"service-YYYY-MM-DD"` â€” matches the pattern used in `get_service_state`.
 fn current_service_session_id() -> String {
     use aletheia_core::now_ms;
     let total_days = now_ms() / 1_000 / 86_400;
@@ -1457,7 +1609,7 @@ fn current_service_session_id() -> String {
 }
 
 pub fn scene_from_candidate(candidate: &ScriptureCandidateDto) -> Result<OutputScene, String> {
-    let session_id = ServiceSessionId::new(&current_service_session_id())
+    let session_id = ServiceSessionId::new(current_service_session_id())
         .map_err(|error| format!("invalid service session id: {error}"))?;
     Ok(OutputScene::scripture(
         format!("scene-{}", candidate.id),
@@ -1478,9 +1630,18 @@ fn detect_production_transcript_candidates() -> Result<Vec<ScriptureCandidateDto
 pub fn detect_candidates_for_transcript(
     transcript: Vec<TranscriptSegmentDto>,
 ) -> Result<Vec<ScriptureCandidateDto>, String> {
-    let session_id = ServiceSessionId::new(&current_service_session_id())
+    let session_id = ServiceSessionId::new(current_service_session_id())
         .map_err(|error| format!("invalid service session id: {error}"))?;
-    let detector = ReferenceKeywordDetector;
+    // Use GrammarScriptureDetector — it runs the grammar parser FIRST
+    // (catching numbered references like "Romans 8:28", "John 3:16",
+    // "First Corinthians thirteen") and layers ReferenceKeywordDetector
+    // matches on top for thematic phrases ("jesus wept", parables, etc.).
+    // The previous polling path used ReferenceKeywordDetector alone, so it
+    // missed every grammar-based reference the live capture pipeline detects
+    // — meaning the analyze_transcript command emitted strictly fewer hits
+    // than the real-time event stream. Same union of detectors here matches
+    // the capture pipeline.
+    let detector = GrammarScriptureDetector;
     let mut context = Vec::new();
     let mut candidates = Vec::new();
 
@@ -1596,7 +1757,7 @@ fn accuracy_validation_fixtures() -> Vec<AccuracyFixture> {
         AccuracyFixture {
             id: "twi-romans",
             language: "Twi",
-            text: "Momma yenhwɛ Romafo 8:28 ansa na yebɔ mpae.",
+            text: "Momma yenhwÉ› Romafo 8:28 ansa na yebÉ” mpae.",
             expected_reference: Some("Romans 8:28"),
         },
         AccuracyFixture {
@@ -1788,6 +1949,7 @@ fn detected_candidate_to_dto(
         source: "Local AI assist".to_string(),
         reason: candidate.reasons.join("; "),
         status: if confidence >= 85 { "preview" } else { "new" }.to_string(),
+        ..Default::default()
     }
 }
 
@@ -1885,11 +2047,7 @@ pub fn sanitize_fts_query(input: &str) -> String {
 }
 
 pub fn parse_reference(input: &str) -> Option<(String, u16, u16)> {
-    let normalized = input
-        .to_lowercase()
-        .replace(':', " ")
-        .replace('.', " ")
-        .replace(',', " ");
+    let normalized = input.to_lowercase().replace([':', '.', ','], " ");
     let parts = normalized.split_whitespace().collect::<Vec<_>>();
     if parts.len() < 3 {
         return None;
@@ -2005,151 +2163,72 @@ pub fn default_search_results() -> Vec<SearchResultDto> {
 }
 
 pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
+    fn demo_seg(id: &str, time: &str, speaker: &str, lang: &str, text: &str, conf: u8, lat: u32) -> TranscriptSegmentDto {
+        TranscriptSegmentDto {
+            id: id.to_string(),
+            time: time.to_string(),
+            speaker: speaker.to_string(),
+            language: lang.to_string(),
+            text: text.to_string(),
+            confidence: conf,
+            latency_ms: lat,
+            is_demo: true,
+        }
+    }
     vec![
-        TranscriptSegmentDto {
-            id: "seg-1842".to_string(),
-            time: "00:18:42".to_string(),
-            speaker: "Pastor Daniel".to_string(),
-            language: "English".to_string(),
-            text: "Turn with me to Romans chapter eight. We will read verse twenty eight together."
-                .to_string(),
-            confidence: 94,
-            latency_ms: 410,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1847".to_string(),
-            time: "00:18:47".to_string(),
-            speaker: "Pastor Daniel".to_string(),
-            language: "English".to_string(),
-            text: "And we know that all things work together for good to them that love God."
-                .to_string(),
-            confidence: 91,
-            latency_ms: 438,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1855".to_string(),
-            time: "00:18:55".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Yoruba".to_string(),
-            text: "A mo pe ohun gbogbo n sise po fun rere fun awon ti won fe Olorun.".to_string(),
-            confidence: 83,
-            latency_ms: 620,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1912".to_string(),
-            time: "00:19:12".to_string(),
-            speaker: "Pastor Daniel".to_string(),
-            language: "English".to_string(),
-            text: "If you are writing notes, add Isaiah forty verse thirty one for later."
-                .to_string(),
-            confidence: 89,
-            latency_ms: 455,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1920-ha".to_string(),
-            time: "00:19:20".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Hausa".to_string(),
-            text: "Mu bude Romawa 8:28 tare da ikilisiya.".to_string(),
-            confidence: 86,
-            latency_ms: 610,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1928-tw".to_string(),
-            time: "00:19:28".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Twi".to_string(),
-            text: "Momma yenhwɛ Romafo 8:28 ansa na yebɔ mpae.".to_string(),
-            confidence: 84,
-            latency_ms: 640,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1936-sw".to_string(),
-            time: "00:19:36".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Swahili".to_string(),
-            text: "Tufungue Warumi 8:28 pamoja na kanisa.".to_string(),
-            confidence: 88,
-            latency_ms: 590,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1944-xh".to_string(),
-            time: "00:19:44".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Xhosa".to_string(),
-            text: "Masivule KwabaseRoma 8:28 namhlanje.".to_string(),
-            confidence: 82,
-            latency_ms: 670,
-        },
-        TranscriptSegmentDto {
-            id: "seg-1952-es".to_string(),
-            time: "00:19:52".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "Spanish".to_string(),
-            text: "Abramos Romanos 8:28 juntos.".to_string(),
-            confidence: 90,
-            latency_ms: 520,
-        },
-        TranscriptSegmentDto {
-            id: "seg-2000-fr".to_string(),
-            time: "00:20:00".to_string(),
-            speaker: "Interpreter".to_string(),
-            language: "French".to_string(),
-            text: "Ouvrons Romains 8:28 ensemble.".to_string(),
-            confidence: 90,
-            latency_ms: 530,
-        },
+        demo_seg("seg-1842", "00:18:42", "Pastor Daniel", "English",
+            "Turn with me to Romans chapter eight. We will read verse twenty eight together.", 94, 410),
+        demo_seg("seg-1847", "00:18:47", "Pastor Daniel", "English",
+            "And we know that all things work together for good to them that love God.", 91, 438),
+        demo_seg("seg-1855", "00:18:55", "Interpreter", "Yoruba",
+            "A mo pe ohun gbogbo n sise po fun rere fun awon ti won fe Olorun.", 83, 620),
+        demo_seg("seg-1912", "00:19:12", "Pastor Daniel", "English",
+            "If you are writing notes, add Isaiah forty verse thirty one for later.", 89, 455),
+        demo_seg("seg-1920-ha", "00:19:20", "Interpreter", "Hausa",
+            "Mu bude Romawa 8:28 tare da ikilisiya.", 86, 610),
+        demo_seg("seg-1928-tw", "00:19:28", "Interpreter", "Twi",
+            "Momma yenhwÉ› Romafo 8:28 ansa na yebÉ” mpae.", 84, 640),
+        demo_seg("seg-1936-sw", "00:19:36", "Interpreter", "Swahili",
+            "Tufungue Warumi 8:28 pamoja na kanisa.", 88, 590),
+        demo_seg("seg-1944-xh", "00:19:44", "Interpreter", "Xhosa",
+            "Masivule KwabaseRoma 8:28 namhlanje.", 82, 670),
+        demo_seg("seg-1952-es", "00:19:52", "Interpreter", "Spanish",
+            "Abramos Romanos 8:28 juntos.", 90, 520),
+        demo_seg("seg-2000-fr", "00:20:00", "Interpreter", "French",
+            "Ouvrons Romains 8:28 ensemble.", 90, 530),
     ]
 }
 
 pub fn production_candidates() -> Vec<ScriptureCandidateDto> {
+    fn demo_cand(id: &str, reference: &str, text: &str, confidence: u8, source: &str, reason: &str, status: &str) -> ScriptureCandidateDto {
+        ScriptureCandidateDto {
+            id: id.to_string(),
+            reference: reference.to_string(),
+            translation: "KJV".to_string(),
+            language: "English".to_string(),
+            text: text.to_string(),
+            confidence,
+            source: source.to_string(),
+            reason: reason.to_string(),
+            status: status.to_string(),
+            is_demo: true,
+            lookup_status: "ok".to_string(),
+            ..Default::default()
+        }
+    }
     vec![
-        ScriptureCandidateDto {
-            id: "romans-828".to_string(),
-            reference: "Romans 8:28".to_string(),
-            translation: "KJV".to_string(),
-            language: "English".to_string(),
-            text: "And we know that all things work together for good to them that love God."
-                .to_string(),
-            confidence: 92,
-            source: "Pastor mic".to_string(),
-            reason: "Exact reference plus quoted phrase in the last 12 seconds.".to_string(),
-            status: "preview".to_string(),
-        },
-        ScriptureCandidateDto {
-            id: "isaiah-4031".to_string(),
-            reference: "Isaiah 40:31".to_string(),
-            translation: "KJV".to_string(),
-            language: "English".to_string(),
-            text: "They that wait upon the LORD shall renew their strength.".to_string(),
-            confidence: 76,
-            source: "Transcript context".to_string(),
-            reason: "Reference was spoken, but no verse text has been quoted yet.".to_string(),
-            status: "new".to_string(),
-        },
-        ScriptureCandidateDto {
-            id: "psalm-231".to_string(),
-            reference: "Psalm 23:1".to_string(),
-            translation: "KJV".to_string(),
-            language: "English".to_string(),
-            text: "The LORD is my shepherd; I shall not want.".to_string(),
-            confidence: 68,
-            source: "Manual fallback".to_string(),
-            reason: "Recent service plan contains Psalm 23 and the phrase matched softly."
-                .to_string(),
-            status: "approved".to_string(),
-        },
-        ScriptureCandidateDto {
-            id: "john-316".to_string(),
-            reference: "John 3:16".to_string(),
-            translation: "KJV".to_string(),
-            language: "English".to_string(),
-            text: "For God so loved the world, that he gave his only begotten Son.".to_string(),
-            confidence: 64,
-            source: "Phrase search".to_string(),
-            reason: "Phrase match only. Operator review required.".to_string(),
-            status: "new".to_string(),
-        },
+        demo_cand("romans-828", "Romans 8:28",
+            "And we know that all things work together for good to them that love God.",
+            92, "Pastor mic", "Exact reference plus quoted phrase in the last 12 seconds.", "preview"),
+        demo_cand("isaiah-4031", "Isaiah 40:31",
+            "They that wait upon the LORD shall renew their strength.",
+            76, "Transcript context", "Reference was spoken, but no verse text has been quoted yet.", "new"),
+        demo_cand("psalm-231", "Psalm 23:1",
+            "The LORD is my shepherd; I shall not want.",
+            68, "Manual fallback", "Recent service plan contains Psalm 23 and the phrase matched softly.", "approved"),
+        demo_cand("john-316", "John 3:16",
+            "For God so loved the world, that he gave his only begotten Son.",
+            64, "Phrase search", "Phrase match only. Operator review required.", "new"),
     ]
 }
 
@@ -2235,32 +2314,16 @@ pub fn live_integrations(state: &DesktopState) -> Vec<IntegrationDto> {
     items
 }
 
-/// Build a health-card list from real disk + DB state. Used by get_service_state
-/// in place of the static demo fixture so the operator dashboard reflects the
-/// machine they are actually about to lead a service from.
-
-
 // ---------------------------------------------------------------------------
 // Trusted plugin registry commands (v6)
 // ---------------------------------------------------------------------------
-
-/// Returns all plugins currently in the trust registry, enabled or disabled.
-
-/// Permanently removes a plugin from the trust registry.
-/// The plugin will no longer be allowed to dispatch outputs.
 
 // ---------------------------------------------------------------------------
 // Calibration dataset commands (v6)
 // ---------------------------------------------------------------------------
 
-/// Records one operator-reviewed transcript/reference pair for accuracy tracking.
-///
-/// `outcome` must be `"confirmed"` | `"corrected"` | `"rejected"`.
-
-/// Returns aggregate accuracy statistics computed from stored calibration samples.
-
 // ---------------------------------------------------------------------------
-// Helper: TrustedPluginRecord → DTO
+// Helper: TrustedPluginRecord â†’ DTO
 // ---------------------------------------------------------------------------
 
 pub fn trusted_plugin_record_to_dto(
@@ -2370,6 +2433,7 @@ mod tests {
             source: "test".to_string(),
             reason: "escape proof".to_string(),
             status: "preview".to_string(),
+            ..Default::default()
         };
 
         let html = obs_browser_source_html(&candidate);
@@ -2384,7 +2448,7 @@ mod tests {
 
 /// Copies model files found in the user's `Downloads\aletheia-models` folder
 /// into the offline-assets directory and records them as installed.
-/// Runs silently — never blocks startup or returns a hard error.
+/// Runs silently â€” never blocks startup or returns a hard error.
 fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
     if let Err(e) = std::fs::create_dir_all(asset_root) {
         log::warn!("[stt-seed] could not create asset dir: {e}");
@@ -2426,7 +2490,7 @@ fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
             continue;
         }
         // Fast path: if the destination file is already in asset_root, just mark
-        // it installed — skip the expensive SHA256 hash and 141 MB copy entirely.
+        // it installed â€” skip the expensive SHA256 hash and 141 MB copy entirely.
         let target = asset_root.join(format!("{asset_id}.bin"));
         if target.exists() {
             let record = OfflineAssetStateRecord {
@@ -2479,13 +2543,24 @@ fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
 // Audio capture + offline STT commands
 // ---------------------------------------------------------------------------
 
-/// Returns the path to the best available STT model in the offline-assets dir.
+/// Returns the path to the best available STT model.
+///
+/// Checks the bundled installer-resource directory first (for the ggml-base.en
+/// model dropped into `src-tauri/resources/models/` at build time), then falls
+/// back to user-installed model packs in the offline-assets directory.
 pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
+    // Bundled-resource search hint, set once at app start by `setup()`.
+    if let Some(resource_dir) = bundled_resource_dir() {
+        let bundled = resource_dir.join("resources/models/ggml-base.en.bin");
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+    }
     // Prefer English-only model, then fall back to any multilingual pack.
     let candidates = [
         "stt-whisper-en-small.bin",
         "stt-whisper-multilingual.bin",
-        // Legacy aliases — kept so installs from older builds keep working.
+        // Legacy aliases â€” kept so installs from older builds keep working.
         "stt-yoruba-pack.bin",
         "stt-hausa-pack.bin",
         "stt-twi-pack.bin",
@@ -2500,7 +2575,21 @@ pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    Err("No offline STT model installed. Install model packs via Health → Offline Model Packs.".to_string())
+    Err("No offline STT model installed. Install model packs via Health â†’ Offline Model Packs.".to_string())
+}
+
+// `OnceLock` cell for the installer's bundled-resource directory. Populated
+// once at startup from `setup()` so `find_stt_model_path` can locate the
+// auto-bundled `ggml-base.en.bin` without threading the path through every
+// call site.
+static BUNDLED_RESOURCE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_bundled_resource_dir(path: PathBuf) {
+    let _ = BUNDLED_RESOURCE_DIR.set(path);
+}
+
+pub fn bundled_resource_dir() -> Option<&'static Path> {
+    BUNDLED_RESOURCE_DIR.get().map(|p| p.as_path())
 }
 
 
@@ -2508,12 +2597,6 @@ pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
 
 
 // ---------------------------------------------------------------------------
-
-/// Called by the frontend immediately after React mounts.
-/// Because the window starts hidden (`"visible": false` in tauri.conf.json),
-/// WebView2 initialises off-screen and never causes a Win32 "(Not Responding)"
-/// flash.  Calling this command makes the window appear only once the JS
-/// engine is alive and the message pump is fully responsive.
 
 // ---------------------------------------------------------------------------
 
@@ -2553,26 +2636,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|app| {
-            let app_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&app_dir)?;
-            let database_path = app_dir.join("aletheia.sqlite3");
-            let desktop_state = DesktopState::open(database_path.clone())
-                .map_err(|message| std::io::Error::new(std::io::ErrorKind::Other, message))?;
-            app.manage(desktop_state);
-
-            // Auto-import bundled full-Bible JSON files on first launch (and on
-            // upgrades that ship updated translations). Runs in the background
-            // so the UI is interactive while ~31 000 verses are inserted.
-            if let Ok(resource_dir) = app.path().resource_dir() {
-                let db_for_bibles = database_path.clone();
-                std::thread::spawn(move || match AletheiaStore::open_file(&db_for_bibles) {
-                    Ok(bg_store) => import_bundled_bibles(&bg_store, &resource_dir),
-                    Err(e) => log::warn!("[bible-import] bg store open failed: {e}"),
-                });
-            }
-
-            // Log at Debug in development, Warn in production so critical messages
-            // are never silently dropped in release builds.
+            // CRITICAL: register the log plugin FIRST so any warnings emitted
+            // during the rest of setup (bible import, state open, scripture
+            // self-test, vMix loop spawn) are captured. Previously this was
+            // registered last and dropped early diagnostic output.
             let log_level = if cfg!(debug_assertions) {
                 log::LevelFilter::Debug
             } else {
@@ -2583,6 +2650,160 @@ pub fn run() {
                     .level(log_level)
                     .build(),
             )?;
+
+            let app_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&app_dir)?;
+            let database_path = app_dir.join("aletheia.sqlite3");
+
+            // Populate the bundled-resource directory hint BEFORE state open /
+            // manage so any early path that resolves the STT model (audit
+            // seeding, health checks triggered during hydration) can find the
+            // bundled `ggml-base.en.bin` from the installer resources dir.
+            if let Ok(resource_dir_early) = app.path().resource_dir() {
+                set_bundled_resource_dir(resource_dir_early);
+            }
+
+            // Bibles re-import sentinel: skip the eager re-import on every
+            // launch unless the bundled-resource hash has changed. This avoids
+            // 31k×N redundant UPSERTs on cold start.
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                let bibles_dir = resource_dir.join("resources").join("bibles");
+                let sentinel_path = app_dir.join("bibles_imported.v1");
+                let needs_import =
+                    bibles_import_needed(&bibles_dir, &sentinel_path);
+                if needs_import {
+                    let bootstrap_store = AletheiaStore::open_file(&database_path)
+                        .map_err(|error| std::io::Error::other(
+                            format!("Cannot prepare bundled Bible database: {error}"),
+                        ))?;
+                    import_bundled_bibles(&bootstrap_store, &resource_dir);
+                    // Best-effort: write the sentinel so subsequent boots skip.
+                    if let Err(e) = write_bibles_sentinel(&bibles_dir, &sentinel_path) {
+                        log::warn!("[bible-import] failed to write sentinel: {e}");
+                    }
+                } else {
+                    log::info!(
+                        "[bible-import] sentinel current — skipping bundled re-import"
+                    );
+                }
+            }
+
+            let desktop_state = DesktopState::open(database_path.clone())
+                .map_err(std::io::Error::other)?;
+            app.manage(desktop_state);
+
+            // vMix auto-reconnect: every N seconds (exponential backoff 10s..5min)
+            // probe the adapter; on offline/degraded re-evaluate via check_status,
+            // which re-runs the HTTP probe and effectively "reconnects". Emit
+            // `aletheia://vmix-reconnect` so the UI can surface attempts.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::time::Duration;
+                    const MIN_DELAY_MS: u64 = 10_000;
+                    const MAX_DELAY_MS: u64 = 5 * 60 * 1000;
+                    let mut delay_ms: u64 = MIN_DELAY_MS;
+                    let mut attempt: u32 = 0;
+                    let mut last_state = String::new();
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let probe_handle = app_handle.clone();
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            let state = probe_handle.state::<DesktopState>();
+                            let adapter = state.lock_vmix().ok()?;
+                            Some(aletheia_output::OutputAdapter::status(&*adapter).health)
+                        }).await.ok().flatten();
+                        let (state_str, _detail) = match result {
+                            Some(h) => crate::output_health_to_state_detail(h),
+                            None => ("offline".to_string(), "vMix probe unavailable".to_string()),
+                        };
+                        let needs_retry = matches!(state_str.as_str(), "offline" | "degraded");
+                        if needs_retry {
+                            attempt = attempt.saturating_add(1);
+                            delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                        } else {
+                            attempt = 0;
+                            delay_ms = MIN_DELAY_MS;
+                        }
+                        // Emit only on state transition or while actively retrying.
+                        // Avoids a steady stream of "still healthy" events to the UI.
+                        if state_str != last_state || needs_retry {
+                            let payload = serde_json::json!({
+                                "state": state_str,
+                                "attempt": attempt,
+                                "nextRetryMs": delay_ms,
+                            });
+                            let _ = tauri::Emitter::emit(&app_handle, "aletheia://vmix-reconnect", payload);
+                            last_state = state_str;
+                        }
+                    }
+                });
+            }
+
+            // Trim the audit log to the last 2,000 rows in a background thread.
+            // This prevents unbounded growth on long-running installs while
+            // keeping a useful window of recent service history.
+            {
+                let db_for_trim = database_path.clone();
+                std::thread::spawn(move || {
+                    match aletheia_store::AletheiaStore::open_file(&db_for_trim) {
+                        Ok(trim_store) => {
+                            match crate::audit::trim_audit_log(&trim_store, 2_000) {
+                                Ok(0) => {}
+                                Ok(n) => log::info!("[audit-trim] pruned {n} old audit rows"),
+                                Err(e) => log::warn!("[audit-trim] failed: {e}"),
+                            }
+                        }
+                        Err(e) => log::warn!("[audit-trim] store open failed: {e}"),
+                    }
+                });
+            }
+
+            // Bundled bible re-import is now sentinel-gated above; no
+            // background re-run is needed on every cold start. The log plugin
+            // was registered as the very first setup step so all subsequent
+            // diagnostic output lands in the log file.
+            //
+            // Run scripture self-test in a background thread so the UI is
+            // interactive while we exercise the canonical fixtures.
+            {
+                let db_for_self_test = database_path.clone();
+                let app_dir_for_self_test = app_dir.clone();
+                std::thread::spawn(move || {
+                    match AletheiaStore::open_file(&db_for_self_test) {
+                        Ok(test_store) => {
+                            // Pre-warm the TF-IDF index for every translation
+                            // loaded in the local DB. Switching translations
+                            // and the very first semantic search are then both
+                            // instant — no cold-start blocking on the UI thread.
+                            let translation_ids: Vec<String> = {
+                                let mut ids = Vec::new();
+                                if let Ok(mut stmt) = test_store
+                                    .connection()
+                                    .prepare("SELECT DISTINCT translation_id FROM scripture_verses")
+                                {
+                                    if let Ok(rows) =
+                                        stmt.query_map([], |r| r.get::<_, String>(0))
+                                    {
+                                        for r in rows.flatten() {
+                                            ids.push(r);
+                                        }
+                                    }
+                                }
+                                ids
+                            };
+                            for id in translation_ids {
+                                crate::scripture_search::warm_translation(&test_store, &id);
+                            }
+                            crate::scripture_search::run_scripture_self_test(
+                                &test_store,
+                                &app_dir_for_self_test,
+                            );
+                        }
+                        Err(e) => log::warn!("[self-test] store open failed: {e}"),
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2653,6 +2874,8 @@ pub fn run() {
             start_audio_capture,
             stop_audio_capture,
             get_capture_status,
+            get_stt_status,
+            reload_stt_model,
             import_bible_translation,
             list_bible_translations,
             show_main_window,
@@ -2679,7 +2902,32 @@ pub fn run() {
             kv_set,
             kv_delete,
             kv_list_keys,
-            list_audio_devices
+            list_audio_devices,
+            delete_bible_translation,
+            export_operator_config,
+            import_operator_config,
+            start_service_session,
+            end_service_session,
+            get_active_session,
+            get_session_candidates,
+            get_session_transcript,
+            approve_candidate,
+            reject_candidate,
+            preview_candidate,
+            take_candidate_live,
+            record_operator_action,
+            clear_all_outputs,
+            check_session_resumption,
+            search_transcript_history,
+            get_service_report,
+            download_stt_model,
+            get_stt_download_progress,
+            reset_stt_download_progress,
+            get_system_diagnostics,
+            get_model_catalogue,
+            crate::scripture_search::search_scripture_unified_cmd,
+            crate::scripture_search::get_scripture_health,
+            crate::scripture_search::run_scripture_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aletheia desktop shell");

@@ -503,7 +503,7 @@ fn ws_upgrade(stream: &mut TcpStream, timeout: &Duration) -> Result<(), ObsError
     let accept_header = response
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
         .map(|v| v.trim().to_string())
         .unwrap_or_default();
 

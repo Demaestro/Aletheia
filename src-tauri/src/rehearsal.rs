@@ -23,7 +23,7 @@ pub fn evaluate_accuracy_fixtures_cmd(state: &DesktopState) -> Result<LocalRehea
     let mut steps: Vec<LocalRehearsalStepDto> = fixtures.iter().map(|fixture| {
         let elapsed = start.elapsed().as_millis() as u32;
         // Re-run each fixture individually so we get per-step pass/fail
-        let single = evaluate_accuracy_fixtures(&detector, &std::slice::from_ref(fixture));
+        let single = evaluate_accuracy_fixtures(&detector, std::slice::from_ref(fixture));
         let (step_state, step_detail) = if fixture.expected_reference.is_some() {
             if single.true_positives > 0 {
                 ("healthy", format!("Detected expected reference in \"{}\"", truncate(fixture.text, 60)))

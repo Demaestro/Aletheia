@@ -315,7 +315,7 @@ fn osc_pad_string(s: &str) -> Vec<u8> {
 fn osc_pad_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
     out.push(0); // null terminator
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out

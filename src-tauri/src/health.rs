@@ -81,27 +81,24 @@ pub fn live_health(state: &DesktopState) -> Result<Vec<HealthItemDto>, String> {
     }
 
     // 5. Scripture library
-    match state.lock_store() {
-        Ok(store) => {
-            let verse_count: i64 = store
-                .connection()
-                .query_row("SELECT COUNT(*) FROM verses", [], |r| r.get(0))
-                .unwrap_or(0);
-            let (lib_state, lib_detail) = if verse_count > 30_000 {
-                ("healthy", format!("{verse_count} KJV verses indexed"))
-            } else if verse_count > 0 {
-                ("degraded", format!("Only {verse_count} verses — library may be incomplete"))
-            } else {
-                ("offline", "Scripture library not seeded — search will fail".to_string())
-            };
-            items.push(HealthItemDto {
-                label: "Scripture library".to_string(),
-                state: lib_state.to_string(),
-                detail: lib_detail.to_string(),
-                action: if lib_state == "offline" { "Restart to reseed".to_string() } else { String::new() },
-            });
-        }
-        Err(_) => {}
+    if let Ok(store) = state.lock_store() {
+        let verse_count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM verses", [], |r| r.get(0))
+            .unwrap_or(0);
+        let (lib_state, lib_detail) = if verse_count > 30_000 {
+            ("healthy", format!("{verse_count} KJV verses indexed"))
+        } else if verse_count > 0 {
+            ("degraded", format!("Only {verse_count} verses — library may be incomplete"))
+        } else {
+            ("offline", "Scripture library not seeded — search will fail".to_string())
+        };
+        items.push(HealthItemDto {
+            label: "Scripture library".to_string(),
+            state: lib_state.to_string(),
+            detail: lib_detail.to_string(),
+            action: if lib_state == "offline" { "Restart to reseed".to_string() } else { String::new() },
+        });
     }
 
     Ok(items)

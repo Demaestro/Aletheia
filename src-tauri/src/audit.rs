@@ -78,6 +78,50 @@ pub fn record_integration_event_state(
         .map_err(|e| e.to_string())
 }
 
+/// Trims the audit log to the last `keep` rows.
+///
+/// Because the log is hash-chained, deleting old rows would break verification
+/// from the beginning. This function:
+///   1. Deletes all rows except the newest `keep`.
+///   2. Resets `previous_hash` on the oldest surviving row to `"genesis"` so
+///      the chain is still internally consistent from that point forward.
+///
+/// Returns the number of rows deleted.
+pub fn trim_audit_log(store: &AletheiaStore, keep: usize) -> Result<usize, String> {
+    let conn = store.connection();
+
+    // Count current rows
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+
+    let keep_i64 = keep as i64;
+    if total <= keep_i64 {
+        return Ok(0);
+    }
+
+    let to_delete = (total - keep_i64) as usize;
+
+    // Delete the oldest rows
+    conn.execute(
+        "DELETE FROM audit_log WHERE id IN (
+            SELECT id FROM audit_log ORDER BY id ASC LIMIT ?1
+        )",
+        rusqlite::params![to_delete],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Reset the chain anchor on the new oldest surviving row
+    conn.execute(
+        "UPDATE audit_log SET previous_hash = 'genesis'
+         WHERE id = (SELECT id FROM audit_log ORDER BY id ASC LIMIT 1)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(to_delete)
+}
+
 fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     let mut output = String::with_capacity(digest.len() * 2);

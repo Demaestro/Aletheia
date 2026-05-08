@@ -5,15 +5,18 @@ export default {
   theme: {
     extend: {
       colors: {
-        ink: "#F8FAFC",
-        graphite: "#94A3B8",
-        muted: "#64748B",
-        line: "#1E293B",
-        mist: "#0F172A",
-        paper: "#020617",
-        accent: "#8B5CF6",
-        caution: "#F59E0B",
-        danger: "#EF4444"
+        // CSS-variable-backed so [data-theme="light"] / [data-theme="dark"]
+        // overrides in styles/index.css can repaint the whole UI without
+        // touching every component className.
+        ink: "var(--c-ink)",
+        graphite: "var(--c-graphite)",
+        muted: "var(--c-muted)",
+        line: "var(--c-line)",
+        mist: "var(--c-mist)",
+        paper: "var(--c-paper)",
+        accent: "var(--c-accent)",
+        caution: "var(--c-caution)",
+        danger: "var(--c-danger)"
       },
       fontFamily: {
         sans: ["Outfit", "Inter", "ui-sans-serif", "system-ui", "sans-serif"],
