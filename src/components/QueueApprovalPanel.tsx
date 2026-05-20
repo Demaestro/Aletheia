@@ -10,6 +10,7 @@ export function QueueApprovalPanel({
   onLive,
   onReject,
   onMerge,
+  onApprove,
   onCalibrate
 }: {
   activeCandidate: ScriptureCandidate;
@@ -18,6 +19,7 @@ export function QueueApprovalPanel({
   onLive: (candidate: ScriptureCandidate) => void;
   onReject?: (candidate: ScriptureCandidate) => void;
   onMerge?: (candidate: ScriptureCandidate) => void;
+  onApprove?: (candidate: ScriptureCandidate) => void;
   onCalibrate?: (candidate: ScriptureCandidate, outcome: "confirmed" | "corrected" | "rejected") => void;
 }) {
   return (
@@ -100,6 +102,10 @@ export function QueueApprovalPanel({
             <ActionButton tone="danger" onClick={() => onReject?.(activeCandidate)}>
               <X className="mr-2 h-4 w-4" aria-hidden="true" />
               Reject
+            </ActionButton>
+            <ActionButton tone="secondary" onClick={() => onApprove?.(activeCandidate)}>
+              <ThumbsUp className="mr-2 h-4 w-4" aria-hidden="true" />
+              Approve
             </ActionButton>
             <ActionButton tone="secondary" onClick={() => onPreview(activeCandidate)}>
               Preview

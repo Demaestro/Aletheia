@@ -1,11 +1,15 @@
 /**
  * VuMeter — real-time microphone level indicator.
  *
- * Uses the Web Audio API (AnalyserNode) to show a live bar that confirms
- * audio is flowing to the STT pipeline without waiting 5+ seconds for the
- * first transcript segment. Only active while capture is running.
+ * Consumes the shared MediaStream from AudioStreamContext instead of
+ * opening its own getUserMedia — prevents the double-stream issue that
+ * forced some Windows USB drivers into sharing mode, adding STT latency.
+ *
+ * Uses getByteTimeDomainData (waveform RMS) for accurate speech-level
+ * metering — frequency-domain RMS badly underreports quiet voices.
  */
 import { useEffect, useRef, useState } from "react";
+import { useAudioStream } from "../contexts/AudioStreamContext";
 
 interface Props {
   /** Pass true while start_audio_capture has succeeded. */
@@ -14,17 +18,20 @@ interface Props {
 }
 
 export function VuMeter({ active, deviceLabel }: Props) {
-  const [level, setLevel] = useState(0);          // 0-100
-  const [peak, setPeak] = useState(0);             // 0-100, sticky peak hold
+  const [level, setLevel]       = useState(0);   // 0-100
+  const [peak, setPeak]         = useState(0);   // 0-100, sticky hold
   const [clipping, setClipping] = useState(false);
-  const animRef = useRef<number>(0);
+
+  const animRef     = useRef<number>(0);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const peakTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Consume the shared stream — no second getUserMedia call.
+  const { stream } = useAudioStream();
+
   useEffect(() => {
-    if (!active) {
+    if (!active || !stream) {
       setLevel(0);
       setPeak(0);
       setClipping(false);
@@ -33,66 +40,55 @@ export function VuMeter({ active, deviceLabel }: Props) {
 
     let cancelled = false;
 
-    navigator.mediaDevices
-      .getUserMedia({ audio: true, video: false })
-      .then((stream) => {
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
-        streamRef.current = stream;
-        const ctx = new AudioContext();
-        audioCtxRef.current = ctx;
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.6;
-        source.connect(analyser);
-        analyserRef.current = analyser;
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.6;
+    source.connect(analyser);
+    analyserRef.current = analyser;
 
-        const data = new Uint8Array(analyser.frequencyBinCount);
+    const data = new Uint8Array(analyser.frequencyBinCount);
 
-        const tick = () => {
-          if (cancelled) return;
-          analyser.getByteFrequencyData(data);
-          // RMS of frequency magnitudes → 0-100
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-          const rms = Math.sqrt(sum / data.length);
-          const pct = Math.min(100, (rms / 255) * 100 * 2.5); // boost to fill bar
-          setLevel(pct);
-          setPeak((prev) => {
-            if (pct >= prev) {
-              if (peakTimerRef.current) clearTimeout(peakTimerRef.current);
-              peakTimerRef.current = setTimeout(() => setPeak(0), 1500);
-              return pct;
-            }
-            return prev;
-          });
-          setClipping(pct >= 95);
-          animRef.current = requestAnimationFrame(tick);
-        };
-        animRef.current = requestAnimationFrame(tick);
-      })
-      .catch(() => {
-        // Permission denied or no mic — meter stays at 0, no crash.
+    const tick = () => {
+      if (cancelled) return;
+      // Time-domain waveform RMS: each byte is 0-255, centred at 128 (silence).
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const deviation = (data[i] - 128) / 128;
+        sum += deviation * deviation;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const pct = Math.min(100, rms * 100 * 3.2); // calibrated boost for speech
+      setLevel(pct);
+      setPeak((prev) => {
+        if (pct >= prev) {
+          if (peakTimerRef.current) clearTimeout(peakTimerRef.current);
+          peakTimerRef.current = setTimeout(() => setPeak(0), 1500);
+          return pct;
+        }
+        return prev;
       });
+      setClipping(pct >= 95);
+      animRef.current = requestAnimationFrame(tick);
+    };
+    animRef.current = requestAnimationFrame(tick);
 
     return () => {
       cancelled = true;
       cancelAnimationFrame(animRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
+      if (peakTimerRef.current) clearTimeout(peakTimerRef.current);
       audioCtxRef.current?.close().catch(() => undefined);
       analyserRef.current = null;
-      streamRef.current = null;
       audioCtxRef.current = null;
     };
-  }, [active]);
+  }, [active, stream]);
 
   if (!active) return null;
 
-  const barColor = clipping
-    ? "#ff4444"
-    : level > 70
-    ? "#ffbb33"
-    : "#22dd88";
+  const barColor = clipping ? "#ff4444" : level > 70 ? "#ffbb33" : "#22dd88";
 
   return (
     <div

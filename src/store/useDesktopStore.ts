@@ -1,11 +1,10 @@
 import { create } from "zustand";
-import type { 
-  ScriptureCandidate, 
-  TranscriptSegment, 
-  DesktopRuntimeStatus, 
-  AiDetectionResult 
+import type {
+  ScriptureCandidate,
+  TranscriptSegment,
+  DesktopRuntimeStatus,
+  AiDetectionResult
 } from "../types";
-import { scriptureCandidates, transcriptSegments } from "../data/production";
 
 const initialRuntimeStatus: DesktopRuntimeStatus = {
   mode: "browser-fallback",
@@ -13,7 +12,7 @@ const initialRuntimeStatus: DesktopRuntimeStatus = {
   databasePath: "Checking desktop store",
   dataMiserEnabled: true,
   offlineModeEnabled: true,
-  destinationsArmed: true,
+  destinationsArmed: false,
   auditCount: 0,
   lastEventSequence: 0,
   checkedAtMs: Date.now()
@@ -74,14 +73,16 @@ interface DesktopState {
 }
 
 export const useDesktopStore = create<DesktopState>((set, get) => ({
-  candidates: scriptureCandidates,
-  transcript: transcriptSegments,
-  previewCandidate: scriptureCandidates[0] || null,
-  liveCandidate: scriptureCandidates[2] || null,
-  selectedCandidate: scriptureCandidates[0] || null,
+  // Start clean — real data arrives from the Rust backend via polling / push events.
+  // Mock data was pre-polluting the queue and masking real detections.
+  candidates: [],
+  transcript: [],
+  previewCandidate: null,
+  liveCandidate: null,
+  selectedCandidate: null,
   desktopStatus: initialRuntimeStatus,
   aiDetection: initialAiDetection,
-  destinationsArmed: true,
+  destinationsArmed: false,
 
   setCandidates: (candidates) => set({ candidates }),
   

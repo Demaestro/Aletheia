@@ -141,6 +141,34 @@ export async function startAudioCapture(languageHint?: string, deviceName?: stri
   return invokeWithTimeout<string>("start_audio_capture", { languageHint, deviceName }, SLOW_OP_TIMEOUT_MS);
 }
 
+/**
+ * Snapshot of the offline Whisper STT engine. Used by the Capture Control
+ * panel so the operator can see at a glance whether speech recognition is
+ * actually loaded and where to drop a model file if not.
+ */
+export type SttStatus = {
+  modelLoaded: boolean;
+  modelPath: string | null;
+  modelFilename: string | null;
+  assetRoot: string | null;
+  loadError: string | null;
+};
+
+export async function getSttStatus(): Promise<SttStatus> {
+  if (!isTauriRuntime()) {
+    return { modelLoaded: false, modelPath: null, modelFilename: null, assetRoot: null, loadError: "Browser preview — desktop runtime required." };
+  }
+  return invokeWithTimeout<SttStatus>("get_stt_status");
+}
+
+/** Re-scans the offline-assets directory and (re)loads the Whisper model. */
+export async function reloadSttModel(): Promise<SttStatus> {
+  if (!isTauriRuntime()) {
+    throw new Error("Reload requires the desktop runtime.");
+  }
+  return invokeWithTimeout<SttStatus>("reload_stt_model", undefined, SLOW_OP_TIMEOUT_MS);
+}
+
 export type BibleTranslationStatus = {
   id: string;
   name: string;
@@ -186,6 +214,34 @@ export async function importBibleTranslation(
     { translationId, translationName, license, jsonPath },
     120_000
   );
+}
+
+/** Deletes a translation and all its verses. Returns rows removed. */
+export async function deleteBibleTranslation(translationId: string): Promise<number> {
+  if (!isTauriRuntime()) {
+    throw new Error("Bible delete requires the desktop runtime.");
+  }
+  return invokeWithTimeout<number>(
+    "delete_bible_translation",
+    { translationId },
+    SLOW_OP_TIMEOUT_MS
+  );
+}
+
+/** Exports operator + integration config as a JSON string. Secrets are redacted. */
+export async function exportOperatorConfig(): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("Config export requires the desktop runtime.");
+  }
+  return invokeWithTimeout<string>("export_operator_config");
+}
+
+/** Imports operator + integration config from a JSON string. */
+export async function importOperatorConfig(json: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("Config import requires the desktop runtime.");
+  }
+  await invokeWithTimeout<null>("import_operator_config", { json });
 }
 
 /**
@@ -339,30 +395,44 @@ function referenceToApiBibleId(reference: string): string | null {
 }
 
 /**
- * Fetch a verse from the free public API.Bible KJV endpoint.
+ * Fetch a verse from the API.Bible KJV endpoint.
  * Returns null on any error so callers can display a graceful fallback.
  *
- * Does NOT require a paid API key — the public KJV bible ID is:
- *   de4e12af7f28f599-01
+ * Reads `VITE_API_BIBLE_KEY` from build-time env. If absent, returns null
+ * after logging exactly ONE warning per session (keyed on a module-scoped flag).
  */
+let _apiBibleKeyWarned = false;
 export async function fetchVerseFromApiBible(
   reference: string
 ): Promise<{ text: string; reference: string } | null> {
+  const apiKey =
+    (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env
+      ?.VITE_API_BIBLE_KEY;
+  if (!apiKey) {
+    if (!_apiBibleKeyWarned) {
+      _apiBibleKeyWarned = true;
+      console.warn(
+        "VITE_API_BIBLE_KEY not set — API.Bible online fallback disabled. " +
+          "Set the env var or rely on the local SQLite library."
+      );
+    }
+    return null;
+  }
+
   const passageId = referenceToApiBibleId(reference);
   if (!passageId) return null;
 
   const BIBLE_ID = "de4e12af7f28f599-01"; // American King James Version (public)
-  const url = `https://api.bible/v1/bibles/${BIBLE_ID}/passages/${passageId}?content-type=text&include-notes=false&include-titles=false&include-chapter-numbers=false&include-verse-numbers=false&include-verse-spans=false`;
+  const url = `https://api.scripture.api.bible/v1/bibles/${BIBLE_ID}/passages/${passageId}?content-type=text&include-notes=false&include-titles=false&include-chapter-numbers=false&include-verse-numbers=false&include-verse-spans=false`;
 
   try {
     const resp = await fetch(url, {
-      headers: { "api-key": "no-key-required-for-public" },
+      headers: { "api-key": apiKey },
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) return null;
     const json = (await resp.json()) as ApiBiblePassageResponse;
     const raw = json?.data?.content ?? "";
-    // Strip HTML tags the API may return
     const text = raw.replace(/<[^>]+>/g, "").trim();
     if (!text) return null;
     return { text, reference: json?.data?.reference ?? reference };
@@ -381,8 +451,8 @@ export async function fetchVerseOnDemand(
   // 1. Try local DB
   try {
     const results = await invokeWithTimeout<Array<{ reference: string; text: string }>>(
-      "search_scripture",
-      { query: reference },
+      "search_scripture_unified_cmd",
+      { query: reference, translationId: "kjv", context: "onDemandFetch" },
       5000
     );
     const hit = results?.find(
@@ -419,7 +489,11 @@ export async function searchScripture(query: string): Promise<ManualSearchResult
   if (!isTauriRuntime()) return fallbackSearch(query);
 
   try {
-    return await invokeWithTimeout<ManualSearchResult[]>("search_scripture", { query });
+    return await invokeWithTimeout<ManualSearchResult[]>("search_scripture_unified_cmd", {
+      query,
+      translationId: "kjv",
+      context: "manualSearch",
+    });
   } catch (error) {
     console.warn("Aletheia local scripture search failed, using browser fallback", error);
     return fallbackSearch(query);
@@ -1888,6 +1962,109 @@ export async function getStreamOverlayServerStatus(): Promise<StreamOverlayServe
   return invokeWithTimeout<StreamOverlayServerStatus>("get_stream_overlay_server_status");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1: session lifecycle, candidate verdicts, panic clear, live events
+// ---------------------------------------------------------------------------
+
+import type { LiveScriptureCandidateDto } from "../gen/LiveScriptureCandidateDto";
+import type { DisplayEventDto } from "../gen/DisplayEventDto";
+
+export async function startServiceSession(): Promise<string> {
+  return invokeWithTimeout<string>("start_service_session");
+}
+
+export async function endServiceSession(): Promise<string | null> {
+  return invokeWithTimeout<string | null>("end_service_session");
+}
+
+export async function getActiveSession(): Promise<string | null> {
+  return invokeWithTimeout<string | null>("get_active_session");
+}
+
+export async function getSessionCandidates(limit = 100): Promise<LiveScriptureCandidateDto[]> {
+  return invokeWithTimeout<LiveScriptureCandidateDto[]>("get_session_candidates", { limit });
+}
+
+export async function getSessionTranscript(limit = 100): Promise<TranscriptSegment[]> {
+  return invokeWithTimeout<TranscriptSegment[]>("get_session_transcript", { limit });
+}
+
+export async function approveCandidate(candidateId: string): Promise<void> {
+  await invokeWithTimeout<void>("approve_candidate", { candidateId });
+}
+
+export async function rejectCandidate(candidateId: string, reason?: string): Promise<void> {
+  await invokeWithTimeout<void>("reject_candidate", { candidateId, reason });
+}
+
+export async function previewCandidate(candidateId: string): Promise<void> {
+  await invokeWithTimeout<void>("preview_candidate", { candidateId });
+}
+
+export async function takeCandidateLive(candidateId: string): Promise<void> {
+  await invokeWithTimeout<void>("take_candidate_live", { candidateId });
+}
+
+export async function recordOperatorAction(
+  actionType: string,
+  candidateId?: string,
+  payloadJson?: string
+): Promise<number> {
+  return invokeWithTimeout<number>("record_operator_action", {
+    actionType,
+    candidateId,
+    payloadJson,
+  });
+}
+
+export async function clearAllOutputs(triggeredBy?: string): Promise<string[]> {
+  return invokeWithTimeout<string[]>("clear_all_outputs", { triggeredBy }, SLOW_OP_TIMEOUT_MS);
+}
+
+export async function onScriptureCandidate(
+  callback: (payload: LiveScriptureCandidateDto) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<LiveScriptureCandidateDto>(
+    "aletheia://scripture-candidate",
+    (event) => callback(event.payload)
+  );
+}
+
+export async function onDisplayEvent(
+  callback: (payload: DisplayEventDto) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<DisplayEventDto>(
+    "aletheia://display-event",
+    (event) => callback(event.payload)
+  );
+}
+
+export async function onOutputsCleared(
+  callback: (targets: string[]) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<string[]>(
+    "aletheia://outputs-cleared",
+    (event) => callback(event.payload)
+  );
+}
+
+export async function onCaptureError(
+  callback: (detail: string) => void
+): Promise<() => void> {
+  if (!isTauriRuntime()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<string>(
+    "aletheia://capture-error",
+    (event) => callback(event.payload)
+  );
+}
+
 function fallbackServiceProfile(
   id: string,
   name: string,
@@ -1904,4 +2081,126 @@ function fallbackServiceProfile(
     createdAtMs: now,
     updatedAtMs: now
   };
+}
+
+// ---------------------------------------------------------------------------
+// #3  Session resumption
+// ---------------------------------------------------------------------------
+
+export type SessionResumptionInfo = {
+  canResume: boolean;
+  sessionId: string | null;
+  sessionName: string | null;
+  startedAtMs: number | null;
+  segmentCount: number;
+  candidateCount: number;
+  crashLogFound: boolean;
+  crashLogPath: string | null;
+};
+
+export async function checkSessionResumption(): Promise<SessionResumptionInfo> {
+  if (!isTauriRuntime()) {
+    return {
+      canResume: false, sessionId: null, sessionName: null, startedAtMs: null,
+      segmentCount: 0, candidateCount: 0, crashLogFound: false, crashLogPath: null,
+    };
+  }
+  return invokeWithTimeout<SessionResumptionInfo>("check_session_resumption");
+}
+
+// ---------------------------------------------------------------------------
+// #5  FTS transcript history search
+// ---------------------------------------------------------------------------
+
+export type TranscriptSearchResult = {
+  segmentId: string;
+  sessionId: string;
+  time: string;
+  speaker: string;
+  language: string;
+  text: string;
+  snippet: string;
+  confidence: number;
+};
+
+export async function searchTranscriptHistory(
+  query: string,
+  limit?: number
+): Promise<TranscriptSearchResult[]> {
+  if (!isTauriRuntime()) return [];
+  return invokeWithTimeout<TranscriptSearchResult[]>(
+    "search_transcript_history",
+    { query, limit: limit ?? 50 },
+    SLOW_OP_TIMEOUT_MS
+  );
+}
+
+// ---------------------------------------------------------------------------
+// #7  Service report
+// ---------------------------------------------------------------------------
+
+export type ServiceReportAction = {
+  occurredAtMs: number;
+  time: string;
+  actionType: string;
+  actor: string;
+  candidateId: string | null;
+  payloadJson: string;
+};
+
+export type ServiceReport = {
+  sessionId: string;
+  sessionName: string;
+  startedAtMs: number;
+  endedAtMs: number | null;
+  durationMinutes: number;
+  segmentCount: number;
+  candidateCount: number;
+  approvedCount: number;
+  rejectedCount: number;
+  liveCount: number;
+  panicClearCount: number;
+  operatorName: string;
+  actions: ServiceReportAction[];
+};
+
+export async function getServiceReport(sessionId?: string): Promise<ServiceReport> {
+  return invokeWithTimeout<ServiceReport>(
+    "get_service_report",
+    { sessionId: sessionId ?? null },
+    SLOW_OP_TIMEOUT_MS
+  );
+}
+
+// ---------------------------------------------------------------------------
+// #9  Whisper model download wizard
+// ---------------------------------------------------------------------------
+
+export type ModelDownloadStatus =
+  | "idle"
+  | "downloading"
+  | "complete"
+  | "error_network"
+  | "error_size";
+
+export type ModelSize = "tiny" | "base" | "small" | "medium";
+
+export async function downloadSttModel(modelSize: ModelSize): Promise<string> {
+  return invokeWithTimeout<string>("download_stt_model", { modelSize }, SLOW_OP_TIMEOUT_MS);
+}
+
+export async function getSttDownloadProgress(): Promise<number> {
+  return invokeWithTimeout<number>("get_stt_download_progress");
+}
+
+export async function resetSttDownloadProgress(): Promise<void> {
+  return invokeWithTimeout<void>("reset_stt_download_progress");
+}
+
+export function parseDownloadStatus(progress: number): ModelDownloadStatus {
+  if (progress === -1) return "idle";
+  if (progress === -2) return "error_network";
+  if (progress === -3) return "error_size";
+  if (progress === 100) return "complete";
+  return "downloading";
 }

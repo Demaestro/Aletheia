@@ -24,7 +24,7 @@ use crate::dto::*;
 use crate::audit::*;
 use crate::{
     scene_from_candidate, output_health_to_state_detail, live_integrations,
-    production_transcript, production_candidates, detect_candidates_for_transcript,
+    production_transcript, detect_candidates_for_transcript,
     language_detections_from_transcript, supported_language_to_dto, accuracy_target_dto,
     merged_offline_asset_manifest, stt_readiness_from_manifest,
     offline_asset_root, sha256_file_hex, verified_manifest_to_dto, scene_to_dto,
@@ -46,12 +46,13 @@ pub fn get_service_state(state: State<'_, DesktopState>) -> Result<ServiceStateD
     let runtime = state.lock_runtime()?.clone();
     let audit_count = state.audit_count()?;
 
-    let live_segments = state.snapshot_live_transcript();
-    let transcript = if live_segments.is_empty() {
-        production_transcript()
-    } else {
-        live_segments
-    };
+    // Live transcript only — never inject `production_transcript()` here.
+    // The 1-second polling loop on the UI calls this command continuously,
+    // so any demo fallback floods the queue with fake candidates and masks
+    // real detections (architecture vision: "wrong scripture is worse than
+    // no scripture"). Empty list → operator sees "Listening for scripture…"
+    // until real audio arrives.
+    let transcript = state.snapshot_live_transcript();
 
     // Build a dynamic session ID based on today's date in UTC.
     let checked_at = now_ms();
@@ -94,7 +95,12 @@ pub fn get_service_state(state: State<'_, DesktopState>) -> Result<ServiceStateD
             checked_at_ms: checked_at,
         },
         transcript,
-        candidates: production_candidates(),
+        // Honest empty queue when the operator hasn't kicked off a session
+        // yet. The previous demo fallback meant the dashboard always showed
+        // "Romans 8:28 / Isaiah 40:31 / Psalm 23:1 / John 3:16" pre-populated
+        // even on a brand-new install — masking the fact that capture wasn't
+        // running and that the scripture library was still warming up.
+        candidates: Vec::new(),
         integrations: live_integrations(&state),
         health,
         preview: runtime.preview,
@@ -111,7 +117,9 @@ pub fn search_scripture(state: State<'_, DesktopState>, query: String) -> Result
 
     let store = state.lock_store()?;
 
-    // Try exact reference parse first.
+    // Try exact reference parse first. `verse_to_search_result` calls
+    // `clean_verse_text_for_display` internally so KJV translator-italics
+    // braces are stripped before the snippet hits the operator UI.
     if let Some((book, chapter, verse)) = parse_reference(trimmed) {
         if let Ok(Some(record)) = store.find_verse("kjv", &book, chapter, verse) {
             return Ok(vec![verse_to_search_result(record, "Exact reference")]);
@@ -232,12 +240,10 @@ pub fn run_pre_service_check(state: State<'_, DesktopState>) -> Result<Vec<Healt
 
 #[tauri::command]
 pub fn analyze_transcript(state: State<'_, DesktopState>) -> Result<AiDetectionResultDto, String> {
-    let live_segments = state.snapshot_live_transcript();
-    let transcript = if live_segments.is_empty() {
-        production_transcript()
-    } else {
-        live_segments
-    };
+    // Live transcript only — see comment in get_service_state. Returning an
+    // empty AI result for an empty transcript is correct; the polling loop
+    // calls this every second and any demo data here pre-pollutes the queue.
+    let transcript = state.snapshot_live_transcript();
     let runtime = state.lock_runtime()?.clone();
     let store = state.lock_store()?;
     let manifest = merged_offline_asset_manifest(&store)?;
@@ -257,7 +263,7 @@ pub fn analyze_transcript(state: State<'_, DesktopState>) -> Result<AiDetectionR
             if candidate.text == "Detected scripture candidate requires operator review." {
                 if let Some((book, chapter, verse)) = parse_reference(&candidate.reference) {
                     if let Ok(Some(record)) = store.find_verse("kjv", &book, chapter, verse) {
-                        candidate.text = record.text;
+                        candidate.text = crate::clean_verse_text_for_display(&record.text);
                     }
                 }
             }
@@ -1602,6 +1608,7 @@ pub fn start_audio_capture(language_hint: Option<String>, device_name: Option<St
                 text: trimmed.to_string(),
                 confidence: 88,
                 latency_ms,
+                ..Default::default()
             };
 
             if let Ok(mut q) = live_transcript.lock() {
@@ -1658,6 +1665,30 @@ pub fn import_bible_translation(
         translation_id,
         verses_inserted: inserted as u32,
     })
+}
+
+/// Deletes a translation and all its verses. Returns the number of verses
+/// removed. Used for re-import workflows when a translation file is corrupt
+/// or the operator wants to swap to a different licensed edition.
+#[tauri::command]
+pub fn delete_bible_translation(
+    translation_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<u32, String> {
+    // Bundled translations auto-restore on next launch, so deleting them just
+    // wastes ~30s of import time on relaunch. Reject at the boundary so a
+    // misbehaving plugin or devtools call cannot kick off that churn.
+    const BUNDLED_IDS: &[&str] = &["kjv", "bbe"];
+    let id = translation_id.trim();
+    if BUNDLED_IDS.contains(&id) {
+        return Err(
+            "Bundled translations cannot be deleted (they auto-restore on next launch).".to_string(),
+        );
+    }
+    let store = state.lock_store()?;
+    store
+        .delete_translation(id)
+        .map_err(|e| e.to_string())
 }
 
 /// Returns verse counts per translation so the UI can show which Bibles are
@@ -1843,4 +1874,237 @@ pub fn test_easyworship_connection(state: State<'_, DesktopState>) -> Result<Ada
         reference: String::new(),
         audit_count: state.audit_count()?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Operator config export / import (booth migration, backup)
+// ---------------------------------------------------------------------------
+
+const REDACTED_MARKER: &str = "<redacted>";
+const EXPORT_INTEGRATION_IDS: &[&str] = &[
+    "vmix-main",
+    "obs-main",
+    "propresenter-main",
+    "companion-main",
+    "osc-main",
+    "easyworship-main",
+];
+
+/// Returns true when the given key looks like it holds a secret value.
+/// Matches common credential field names plus `*_key`, `*_secret`, `*_token`
+/// suffix patterns so configs like `webhookToken` / `apiKey` / `clientSecret`
+/// are caught without an exhaustive allowlist.
+fn is_secret_key(lowercase_key: &str) -> bool {
+    matches!(
+        lowercase_key,
+        "password" | "passwd" | "pwd" | "secret" | "token" | "api_key" | "apikey"
+            | "auth" | "authorization" | "bearer" | "credential" | "credentials"
+            | "access_key" | "accesskey" | "private_key" | "privatekey"
+    ) || lowercase_key.ends_with("password")
+        || lowercase_key.ends_with("_secret")
+        || lowercase_key.ends_with("secret")
+        || lowercase_key.ends_with("_token")
+        || lowercase_key.ends_with("token")
+        || lowercase_key.ends_with("_key")
+        || lowercase_key.ends_with("apikey")
+}
+
+/// Masks credentials embedded in a URL (user:pass@host) and JWT-shaped strings
+/// (three base64url segments separated by dots, long enough to be real).
+fn scrub_string(s: &str) -> Option<String> {
+    // URL-embedded credentials: scheme://user:pass@host/...
+    // Only rewrite when both userinfo AND an '@' separator are present.
+    if let Some(scheme_end) = s.find("://") {
+        let rest = &s[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            let userinfo = &rest[..at];
+            if userinfo.contains(':') {
+                let (scheme, _) = s.split_at(scheme_end + 3);
+                return Some(format!("{scheme}{REDACTED_MARKER}@{}", &rest[at + 1..]));
+            }
+        }
+    }
+    // JWT-shaped: three segments of base64url chars, each ≥10 chars.
+    let segs: Vec<&str> = s.split('.').collect();
+    if segs.len() == 3
+        && segs.iter().all(|seg| {
+            seg.len() >= 10
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+    {
+        return Some(REDACTED_MARKER.to_string());
+    }
+    None
+}
+
+/// Walks `value` mutably and replaces any string field whose key matches a
+/// known secret name with a redaction marker. Also scrubs URL-embedded
+/// credentials and JWT-shaped strings found anywhere in the tree.
+fn redact_secrets_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                let lk = k.to_lowercase();
+                if is_secret_key(&lk) && v.is_string() {
+                    *v = serde_json::Value::String(REDACTED_MARKER.to_string());
+                } else {
+                    redact_secrets_in_place(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_secrets_in_place(item);
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Some(scrubbed) = scrub_string(s) {
+                *s = scrubbed;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Strips redacted markers out of an inbound config so we don't overwrite the
+/// operator's real credentials with the literal `"<redacted>"` placeholder.
+fn drop_redacted_in_place(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        let keys_to_clear: Vec<String> = map
+            .iter()
+            .filter_map(|(k, v)| match v {
+                serde_json::Value::String(s) if s == REDACTED_MARKER => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        for k in keys_to_clear {
+            map.remove(&k);
+        }
+        for v in map.values_mut() {
+            drop_redacted_in_place(v);
+        }
+    } else if let serde_json::Value::Array(items) = value {
+        for item in items.iter_mut() {
+            drop_redacted_in_place(item);
+        }
+    }
+}
+
+#[tauri::command]
+pub fn export_operator_config(state: State<'_, DesktopState>) -> Result<String, String> {
+    let store = state.lock_store()?;
+    let mut integrations = serde_json::Map::new();
+    for id in EXPORT_INTEGRATION_IDS {
+        if let Some(rec) = store.get_integration_config(id).map_err(|e| e.to_string())? {
+            let mut cfg: serde_json::Value =
+                serde_json::from_str(&rec.config_json).unwrap_or(serde_json::Value::Null);
+            redact_secrets_in_place(&mut cfg);
+            integrations.insert(
+                (*id).to_string(),
+                serde_json::json!({
+                    "kind": rec.kind,
+                    "displayName": rec.display_name,
+                    "enabled": rec.enabled,
+                    "config": cfg,
+                }),
+            );
+        }
+    }
+    let runtime = state.lock_runtime()?;
+    let payload = serde_json::json!({
+        "version": 1,
+        "exportedAtMs": now_ms(),
+        "operatorName": runtime.operator_name,
+        "integrations": integrations,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn import_operator_config(json: String, state: State<'_, DesktopState>) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("Invalid JSON: {e}"))?;
+    let version = parsed.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != 1 {
+        return Err(format!("Unsupported config version: {version}"));
+    }
+    if let Some(name) = parsed.get("operatorName").and_then(|v| v.as_str()) {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            let mut runtime = state.lock_runtime()?;
+            runtime.operator_name = trimmed.to_string();
+        }
+    }
+    if let Some(integrations) = parsed.get("integrations").and_then(|v| v.as_object()) {
+        let store = state.lock_store()?;
+        for (id, entry) in integrations {
+            // Ignore unknown IDs entirely — an export from a future build or a
+            // tampered file shouldn't be able to introduce arbitrary records.
+            if !EXPORT_INTEGRATION_IDS.contains(&id.as_str()) {
+                continue;
+            }
+            let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let display_name = entry
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id);
+            let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut cfg = entry
+                .get("config")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            let existing = store
+                .get_integration_config(id)
+                .map_err(|e| e.to_string())?;
+
+            // Enforce kind immutability against the current record. Prevents a
+            // tampered file from swapping, say, the "obs-main" record's kind
+            // to something else and confusing adapter lookups downstream.
+            let effective_kind: String = if let Some(ref rec) = existing {
+                if !kind.is_empty() && kind != rec.kind {
+                    return Err(format!(
+                        "Import rejected: integration '{id}' kind '{kind}' does not match existing '{}'.",
+                        rec.kind
+                    ));
+                }
+                rec.kind.clone()
+            } else {
+                kind.to_string()
+            };
+
+            // Merge: keep existing secrets when the import payload has redacted them.
+            if let Some(existing) = existing {
+                if let Ok(existing_cfg) =
+                    serde_json::from_str::<serde_json::Value>(&existing.config_json)
+                {
+                    drop_redacted_in_place(&mut cfg);
+                    if let (Some(new_obj), Some(old_obj)) =
+                        (cfg.as_object_mut(), existing_cfg.as_object())
+                    {
+                        for (k, v) in old_obj {
+                            new_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+            } else {
+                drop_redacted_in_place(&mut cfg);
+            }
+            let config_json = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
+            store
+                .upsert_integration_config(&IntegrationConfigRecord {
+                    id: id.clone(),
+                    kind: effective_kind,
+                    display_name: display_name.to_string(),
+                    enabled,
+                    config_json,
+                    secret_ref: None,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    state.persist_session()?;
+    Ok(())
 }

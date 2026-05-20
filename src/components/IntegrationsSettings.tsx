@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Cable, FileText, Network, PlugZap, RadioTower, SlidersHorizontal, Trash2 } from "lucide-react";
 import { integrations as defaultIntegrations } from "../data/production";
-import { generateEasyWorshipSmbSetupGuide } from "../services/desktopApi";
+import {
+  generateEasyWorshipSmbSetupGuide,
+  exportOperatorConfig,
+  importOperatorConfig
+} from "../services/desktopApi";
 
 import type {
   AdapterDispatchResult,
@@ -195,6 +199,79 @@ export function IntegrationsSettings({
   const [manifestPath, setManifestPath] = useState("");
   const [trustedKeyIds, setTrustedKeyIds] = useState("");
   const [operatorDraft, setOperatorDraft] = useState(operatorName);
+  const [vmixSaveResult, setVmixSaveResult] = useState<"saving" | "ok" | "fail" | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [configMessage, setConfigMessage] = useState<string | null>(null);
+
+  const saveCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Watch vmixStatus after save+check, surface a transient banner. Cancels the
+  // fallback fail-timer as soon as the status transitions out of "saving" so
+  // a late backend response can't flip ok → fail.
+  useEffect(() => {
+    if (vmixSaveResult !== "saving") return;
+    const ok = vmixStatus?.state === "connected" || vmixStatus?.state === "ready";
+    if (ok) {
+      if (saveCheckTimerRef.current) {
+        clearTimeout(saveCheckTimerRef.current);
+        saveCheckTimerRef.current = null;
+      }
+      setVmixSaveResult("ok");
+    } else if (vmixStatus?.state === "offline" || vmixStatus?.state === "degraded") {
+      if (saveCheckTimerRef.current) {
+        clearTimeout(saveCheckTimerRef.current);
+        saveCheckTimerRef.current = null;
+      }
+      setVmixSaveResult("fail");
+    }
+  }, [vmixStatus?.state, vmixStatus?.checkedAtMs, vmixSaveResult]);
+
+  useEffect(() => {
+    if (vmixSaveResult !== "ok" && vmixSaveResult !== "fail") return;
+    const t = setTimeout(() => setVmixSaveResult(null), 4000);
+    return () => clearTimeout(t);
+  }, [vmixSaveResult]);
+
+  const handleSaveAndCheckVmix = () => {
+    onSaveVmixConfig?.(draft);
+    setVmixSaveResult("saving");
+    onCheckVmix?.();
+    if (saveCheckTimerRef.current) clearTimeout(saveCheckTimerRef.current);
+    saveCheckTimerRef.current = setTimeout(() => {
+      setVmixSaveResult((cur) => (cur === "saving" ? "fail" : cur));
+      saveCheckTimerRef.current = null;
+    }, 2000);
+  };
+
+  const handleExportConfig = async () => {
+    setConfigMessage(null);
+    try {
+      const json = await exportOperatorConfig();
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `aletheia-config-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setConfigMessage("Config exported. Secrets were redacted.");
+    } catch (err) {
+      setConfigMessage(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleImportConfig = async () => {
+    setConfigMessage(null);
+    try {
+      await importOperatorConfig(importText);
+      setConfigMessage("Config imported. Re-enter passwords for adapters that use auth.");
+      setShowImportModal(false);
+      setImportText("");
+    } catch (err) {
+      setConfigMessage(`Import failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
   const vmixTone = statusTone(vmixStatus.state);
   const obsTone = statusTone(obsStatus?.state ?? "offline");
   const ppTone = statusTone(proPresenterStatus?.state ?? "offline");
@@ -215,7 +292,7 @@ export function IntegrationsSettings({
         action={<ActionButton onClick={onCheckVmix}>Check vMix</ActionButton>}
       />
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4">
         {categories.map((category) => {
           const Icon = category.icon;
           return (
@@ -228,33 +305,46 @@ export function IntegrationsSettings({
         })}
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-        <div className="rounded-[6px] border border-white/5 bg-white/5">
-          <div className="grid grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] border-b border-white/5 px-4 py-3 text-xs font-semibold uppercase tracking-[0.12em] text-muted">
-            <span>Adapter</span>
-            <span>Transport</span>
-            <span>Capability</span>
+      {/* ── Adapter list + vMix config ── */}
+      <div className="grid gap-5 2xl:grid-cols-[1fr_440px]">
+
+        {/* Adapter cards */}
+        <div className="overflow-hidden rounded-[8px] border border-white/8 bg-white/[0.035]">
+
+          {/* Column header */}
+          <div className="grid grid-cols-[1fr_auto] border-b border-white/8 px-5 py-3 text-[11px] font-semibold uppercase tracking-widest text-muted">
+            <span>Adapter · Capability</span>
             <span>Status</span>
           </div>
-          <div className="divide-y divide-line">
+
+          {/* Rows */}
+          <div className="divide-y divide-white/[0.05]">
             {integrations.map((integration) => (
               <button
                 key={integration.id}
                 type="button"
-                className="group grid w-full grid-cols-[minmax(220px,1fr)_180px_minmax(260px,1.1fr)_160px] items-center px-4 py-4 text-left transition hover:bg-mist focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                className="group flex w-full items-start gap-4 px-5 py-4 text-left transition-colors hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
               >
-                <span className="flex items-center gap-3">
-                  <span className="grid h-9 w-9 place-items-center rounded-[6px] border border-white/5 bg-paper">
-                    <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
-                  </span>
-                  <span>
-                    <span className="block text-sm font-semibold text-ink">{integration.name}</span>
-                    <span className="mt-1 block text-xs text-muted">{integration.detail}</span>
-                  </span>
+                {/* Icon */}
+                <span className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-[6px] border border-white/8 bg-paper">
+                  <PlugZap className="h-4 w-4 text-accent" aria-hidden="true" />
                 </span>
-                <span className="text-sm text-graphite">{integration.kind}</span>
-                <span className="text-sm text-muted">{integration.capability}</span>
-                <span className="flex justify-end">
+
+                {/* Name + transport + capability */}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-ink">{integration.name}</span>
+                  <span className="mt-0.5 block text-xs text-muted">
+                    <span className="font-medium text-graphite">{integration.kind}</span>
+                    {" — "}
+                    {integration.capability}
+                  </span>
+                  {integration.detail && (
+                    <span className="mt-1 block text-xs text-muted/70">{integration.detail}</span>
+                  )}
+                </span>
+
+                {/* Status pill */}
+                <span className="mt-0.5 flex-none">
                   <StatusPill tone={statusTone(integration.state)} label={integration.state} />
                 </span>
               </button>
@@ -262,14 +352,14 @@ export function IntegrationsSettings({
           </div>
         </div>
 
-        <aside className="space-y-4">
-          <div className="rounded-[6px] border border-white/5 bg-white/5 p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">vMix bridge</p>
-                <h3 className="mt-2 text-xl font-semibold tracking-tight text-ink">Overlay scripture title</h3>
+        <aside className="min-w-0 space-y-4">
+          <div className="rounded-[8px] border border-white/8 bg-white/[0.035] p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-muted">vMix bridge</p>
+                <h3 className="mt-1 text-lg font-semibold tracking-tight text-ink">Overlay scripture title</h3>
               </div>
-              <StatusPill tone={vmixTone} label={vmixStatus.state} />
+              <span className="flex-none"><StatusPill tone={vmixTone} label={vmixStatus.state} /></span>
             </div>
 
             <p className="mt-4 text-sm leading-6 text-muted">{vmixStatus.detail}</p>
@@ -311,8 +401,24 @@ export function IntegrationsSettings({
               </p>
             </div>
 
+            {vmixSaveResult && (
+              <p
+                className={`mt-3 text-xs ${
+                  vmixSaveResult === "ok"
+                    ? "text-emerald-300"
+                    : vmixSaveResult === "fail"
+                    ? "text-amber-300"
+                    : "text-muted"
+                }`}
+                aria-live="polite"
+              >
+                {vmixSaveResult === "saving" && "Saving and verifying…"}
+                {vmixSaveResult === "ok" && "✓ Saved & verified."}
+                {vmixSaveResult === "fail" && `⚠ Saved, but check failed: ${vmixStatus.detail}`}
+              </p>
+            )}
             <div className="mt-5 grid grid-cols-2 gap-2 border-t border-white/5 pt-5">
-              <ActionButton tone="secondary" onClick={() => onSaveVmixConfig?.(draft)}>
+              <ActionButton tone="secondary" onClick={handleSaveAndCheckVmix}>
                 Save config
               </ActionButton>
               <ActionButton tone="secondary" onClick={onCheckVmix}>
@@ -575,6 +681,35 @@ export function IntegrationsSettings({
                 <ActionButton className="mt-4 w-full" tone="secondary" onClick={onExportBoothPack}>
                   Export booth pack
                 </ActionButton>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <ActionButton tone="secondary" onClick={() => void handleExportConfig()}>
+                    Export config
+                  </ActionButton>
+                  <ActionButton tone="secondary" onClick={() => setShowImportModal(true)}>
+                    Import config
+                  </ActionButton>
+                </div>
+                {configMessage && (
+                  <p className="mt-2 text-xs text-muted" aria-live="polite">{configMessage}</p>
+                )}
+                {showImportModal && (
+                  <div className="mt-3 rounded-[6px] border border-white/10 bg-paper p-3">
+                    <p className="text-xs font-semibold text-ink">Paste config JSON</p>
+                    <textarea
+                      value={importText}
+                      onChange={(e) => setImportText(e.target.value)}
+                      rows={6}
+                      className="mt-2 w-full rounded-[6px] border border-white/10 bg-mist p-2 text-xs font-mono text-ink outline-none focus:border-accent"
+                      placeholder='{"version":1, ...}'
+                    />
+                    <div className="mt-2 flex gap-2">
+                      <ActionButton onClick={() => void handleImportConfig()}>Apply</ActionButton>
+                      <ActionButton tone="secondary" onClick={() => { setShowImportModal(false); setImportText(""); }}>
+                        Cancel
+                      </ActionButton>
+                    </div>
+                  </div>
+                )}
                 {boothPackExport ? (
                   <div className="mt-4 rounded-[6px] border border-white/5 bg-paper p-3">
                     <p className="break-words font-mono text-xs text-ink">{boothPackExport.path}</p>
@@ -758,7 +893,7 @@ function TextField({ label, value, onChange }: { label: string; value: string; o
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );
@@ -774,7 +909,7 @@ function NumberField({ label, value, min, max, onChange }: { label: string; valu
         max={max}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
-        className="mt-1 h-10 w-full rounded-[6px] border border-white/5 bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent focus:bg-white/5"
+        className="mt-1 h-10 w-full rounded-[6px] border border-line bg-paper px-3 font-mono text-xs text-ink outline-none transition focus:border-accent"
       />
     </label>
   );

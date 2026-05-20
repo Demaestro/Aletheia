@@ -14,7 +14,11 @@ export type ScreenKey =
   | "stream"
   | "songs"
   | "fleet"
-  | "clips";
+  | "clips"
+  | "service-report"
+  | "transcript-search"
+  | "diagnostics";
+
 
 export type Tone = "healthy" | "degraded" | "offline" | "live" | "armed" | "neutral";
 

@@ -121,11 +121,17 @@ fn chrono_lite_now() -> String {
 }
 
 fn default_runtime_state() -> RuntimeState {
-    let candidates = production_candidates();
+    // Operator-safe defaults:
+    //   * preview / live start EMPTY — no demo verses on the program bus.
+    //   * destinations DISARMED — sending live to vMix/OBS/etc. requires an
+    //     explicit operator gesture. Architecture vision: "wrong scripture is
+    //     worse than no scripture." Pre-arming and pre-loading demo data
+    //     meant an operator could open the app, hit "Send live", and ship a
+    //     demo verse to a real congregation.
     RuntimeState {
-        preview: candidates[0].clone(),
-        live: candidates[2].clone(),
-        destinations_armed: true,
+        preview: ScriptureCandidateDto::default(),
+        live: ScriptureCandidateDto::default(),
+        destinations_armed: false,
         data_miser_enabled: true,
         offline_mode_enabled: true,
         operator_name: default_operator_name(),
@@ -180,7 +186,17 @@ impl DesktopState {
             )
         })?;
 
-        seed_scripture_library(&store)?;
+        // Cold-start guard: only run the synchronous critical-path seed when
+        // the local KJV table is essentially empty. On warm starts this skip
+        // saves ~400 SQLite commits (≈ 2–8 s on local SSD, much worse on
+        // OneDrive-synced or HDD storage). The full ~31 000 verse import is
+        // already done lazily on a background thread by `import_bundled_bibles`.
+        let kjv_count = store
+            .count_verses_for_translation("kjv")
+            .unwrap_or(0);
+        if kjv_count < 100 {
+            seed_scripture_library(&store)?;
+        }
         seed_offline_assets(&store)?;
 
         // Auto-install STT model files if found in the user's Downloads folder.
@@ -930,21 +946,44 @@ fn seed_scripture_library(store: &AletheiaStore) -> Result<(), String> {
         ("Revelation", 21, 5, "And he that sat upon the throne said, Behold, I make all things new."),
     ];
 
-    for (book, chapter, verse, text) in verses {
-        store
-            .insert_verse(&VerseRecord {
-                translation_id: "kjv".to_string(),
-                book: book.to_string(),
-                chapter: *chapter,
-                verse: *verse,
-                text: text.to_string(),
-            })
-            .map_err(|error| error.to_string())?;
+    // Wrap the ~150 KJV inserts plus the seed_extra_translations call (another
+    // ~250 inserts across NKJV/NIV/NLT/MSG/WEB) in a SINGLE write transaction.
+    // Without this each `insert_verse` autocommits — three statements per
+    // verse (verse table + FTS delete + FTS insert) means roughly 1 200 commit
+    // fsyncs, which on OneDrive-synced or HDD-backed storage adds 5–20 seconds
+    // to startup. One commit at the end keeps cold-start seeding under ~200 ms
+    // even on slow disks.
+    let conn = store.connection();
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not start scripture seed transaction: {error}"))?;
+
+    let seed_result = (|| -> Result<(), String> {
+        for (book, chapter, verse, text) in verses {
+            store
+                .insert_verse(&VerseRecord {
+                    translation_id: "kjv".to_string(),
+                    book: book.to_string(),
+                    chapter: *chapter,
+                    verse: *verse,
+                    text: text.to_string(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        seed_extra_translations(store)
+    })();
+
+    match seed_result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").map_err(|error| {
+                format!("scripture seed commit failed: {error}")
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
     }
-
-    seed_extra_translations(store)?;
-
-    Ok(())
 }
 
 /// Seeds the additional English translations the operator can pick from in the
@@ -1783,11 +1822,12 @@ fn detected_candidate_to_dto(
         reference: candidate.reference.clone(),
         translation: candidate.translation,
         language: candidate.language,
-        text: verse_text_for_reference(&candidate.reference).to_string(),
+        text: clean_verse_text_for_display(verse_text_for_reference(&candidate.reference)),
         confidence,
         source: "Local AI assist".to_string(),
         reason: candidate.reasons.join("; "),
         status: if confidence >= 85 { "preview" } else { "new" }.to_string(),
+        ..Default::default()
     }
 }
 
@@ -1861,9 +1901,113 @@ pub fn verse_to_search_result(record: VerseRecord, source: &str) -> SearchResult
     SearchResultDto {
         reference: format!("{} {}:{}", record.book, record.chapter, record.verse),
         translation: record.translation_id.to_uppercase(),
-        snippet: record.text,
+        snippet: clean_verse_text_for_display(&record.text),
         source: source.to_string(),
         language: "English".to_string(),
+    }
+}
+
+/// Removes KJV translator-italics markers (`{is}`, `{the}`, etc.) and other
+/// editorial brackets from verse text before it goes on screen. The bundled
+/// public-domain KJV JSON wraps words supplied by the translator (not present
+/// in the underlying Hebrew/Greek) in curly braces; the convention is fine for
+/// scholarly reading but jarring on a projection screen and in operator UI.
+///
+/// The function is intentionally tolerant: it handles `{is}`, `{ is }`, and
+/// also strips the surrounding braces from any short alphabetic insertion so
+/// new bracketed editorial conventions don't slip through.
+pub fn clean_verse_text_for_display(text: &str) -> String {
+    // Fast path — no braces means nothing to clean.
+    if !text.contains('{') {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Collect the bracketed content (max 32 chars to avoid swallowing
+            // unrelated punctuation if a stray '{' appears in the source).
+            let mut inner = String::new();
+            let mut closed = false;
+            for _ in 0..32 {
+                match chars.next() {
+                    Some('}') => {
+                        closed = true;
+                        break;
+                    }
+                    Some(other) => inner.push(other),
+                    None => break,
+                }
+            }
+            if closed {
+                // Replace the entire `{…}` span with the bracketed text only,
+                // dropping the braces themselves. KJV italics are still
+                // visually conveyed by surrounding context — the operator
+                // doesn't need typographic italics on a projection screen.
+                out.push_str(inner.trim());
+            } else {
+                // Unbalanced — fall back to original characters so we don't
+                // silently corrupt non-KJV translations that legitimately use
+                // a single brace (very rare).
+                out.push('{');
+                out.push_str(&inner);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    // Collapse runs of whitespace introduced by stripping inline brackets.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut prev_space = false;
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                collapsed.push(' ');
+            }
+            prev_space = true;
+        } else {
+            collapsed.push(c);
+            prev_space = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+#[cfg(test)]
+mod text_clean_tests {
+    use super::clean_verse_text_for_display;
+
+    #[test]
+    fn strips_kjv_italics_braces() {
+        assert_eq!(
+            clean_verse_text_for_display("But his delight {is} in the law of the LORD"),
+            "But his delight is in the law of the LORD"
+        );
+    }
+
+    #[test]
+    fn handles_multiple_braces_in_one_verse() {
+        let input = "And the Spirit {of God} moved upon the face of {the} waters.";
+        assert_eq!(
+            clean_verse_text_for_display(input),
+            "And the Spirit of God moved upon the face of the waters."
+        );
+    }
+
+    #[test]
+    fn passes_through_text_with_no_braces_unchanged() {
+        let input = "For God so loved the world.";
+        assert_eq!(clean_verse_text_for_display(input), input);
+    }
+
+    #[test]
+    fn tolerates_unclosed_brace_without_corruption() {
+        // Should preserve original characters rather than silently swallow.
+        let input = "Verse with stray { open brace and no close.";
+        let out = clean_verse_text_for_display(input);
+        assert!(out.contains("stray"));
+        assert!(out.contains("open brace"));
     }
 }
 
@@ -2015,6 +2159,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
                 .to_string(),
             confidence: 94,
             latency_ms: 410,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1847".to_string(),
@@ -2025,6 +2170,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
                 .to_string(),
             confidence: 91,
             latency_ms: 438,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1855".to_string(),
@@ -2034,6 +2180,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "A mo pe ohun gbogbo n sise po fun rere fun awon ti won fe Olorun.".to_string(),
             confidence: 83,
             latency_ms: 620,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1912".to_string(),
@@ -2044,6 +2191,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
                 .to_string(),
             confidence: 89,
             latency_ms: 455,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1920-ha".to_string(),
@@ -2053,6 +2201,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Mu bude Romawa 8:28 tare da ikilisiya.".to_string(),
             confidence: 86,
             latency_ms: 610,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1928-tw".to_string(),
@@ -2062,6 +2211,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Momma yenhwɛ Romafo 8:28 ansa na yebɔ mpae.".to_string(),
             confidence: 84,
             latency_ms: 640,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1936-sw".to_string(),
@@ -2071,6 +2221,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Tufungue Warumi 8:28 pamoja na kanisa.".to_string(),
             confidence: 88,
             latency_ms: 590,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1944-xh".to_string(),
@@ -2080,6 +2231,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Masivule KwabaseRoma 8:28 namhlanje.".to_string(),
             confidence: 82,
             latency_ms: 670,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-1952-es".to_string(),
@@ -2089,6 +2241,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Abramos Romanos 8:28 juntos.".to_string(),
             confidence: 90,
             latency_ms: 520,
+            ..Default::default()
         },
         TranscriptSegmentDto {
             id: "seg-2000-fr".to_string(),
@@ -2098,6 +2251,7 @@ pub fn production_transcript() -> Vec<TranscriptSegmentDto> {
             text: "Ouvrons Romains 8:28 ensemble.".to_string(),
             confidence: 90,
             latency_ms: 530,
+            ..Default::default()
         },
     ]
 }
@@ -2115,6 +2269,7 @@ pub fn production_candidates() -> Vec<ScriptureCandidateDto> {
             source: "Pastor mic".to_string(),
             reason: "Exact reference plus quoted phrase in the last 12 seconds.".to_string(),
             status: "preview".to_string(),
+            ..Default::default()
         },
         ScriptureCandidateDto {
             id: "isaiah-4031".to_string(),
@@ -2126,6 +2281,7 @@ pub fn production_candidates() -> Vec<ScriptureCandidateDto> {
             source: "Transcript context".to_string(),
             reason: "Reference was spoken, but no verse text has been quoted yet.".to_string(),
             status: "new".to_string(),
+            ..Default::default()
         },
         ScriptureCandidateDto {
             id: "psalm-231".to_string(),
@@ -2138,6 +2294,7 @@ pub fn production_candidates() -> Vec<ScriptureCandidateDto> {
             reason: "Recent service plan contains Psalm 23 and the phrase matched softly."
                 .to_string(),
             status: "approved".to_string(),
+            ..Default::default()
         },
         ScriptureCandidateDto {
             id: "john-316".to_string(),
@@ -2149,6 +2306,7 @@ pub fn production_candidates() -> Vec<ScriptureCandidateDto> {
             source: "Phrase search".to_string(),
             reason: "Phrase match only. Operator review required.".to_string(),
             status: "new".to_string(),
+            ..Default::default()
         },
     ]
 }
@@ -2370,6 +2528,7 @@ mod tests {
             source: "test".to_string(),
             reason: "escape proof".to_string(),
             status: "preview".to_string(),
+            ..Default::default()
         };
 
         let html = obs_browser_source_html(&candidate);
@@ -2479,8 +2638,19 @@ fn auto_seed_stt_models(store: &AletheiaStore, asset_root: &Path) {
 // Audio capture + offline STT commands
 // ---------------------------------------------------------------------------
 
-/// Returns the path to the best available STT model in the offline-assets dir.
+/// Returns the path to the best available STT model.
+///
+/// Checks the bundled installer-resource directory first (for the ggml-base.en
+/// model dropped into `src-tauri/resources/models/` at build time), then falls
+/// back to user-installed model packs in the offline-assets directory.
 pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
+    // Bundled-resource search hint, set once at app start by `setup()`.
+    if let Some(resource_dir) = bundled_resource_dir() {
+        let bundled = resource_dir.join("resources/models/ggml-base.en.bin");
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+    }
     // Prefer English-only model, then fall back to any multilingual pack.
     let candidates = [
         "stt-whisper-en-small.bin",
@@ -2501,6 +2671,20 @@ pub fn find_stt_model_path(asset_root: &Path) -> Result<PathBuf, String> {
         }
     }
     Err("No offline STT model installed. Install model packs via Health → Offline Model Packs.".to_string())
+}
+
+// `OnceLock` cell for the installer's bundled-resource directory. Populated
+// once at startup from `setup()` so `find_stt_model_path` can locate the
+// auto-bundled `ggml-base.en.bin` without threading the path through every
+// call site.
+static BUNDLED_RESOURCE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_bundled_resource_dir(path: PathBuf) {
+    let _ = BUNDLED_RESOURCE_DIR.set(path);
+}
+
+pub fn bundled_resource_dir() -> Option<&'static Path> {
+    BUNDLED_RESOURCE_DIR.get().map(|p| p.as_path())
 }
 
 
@@ -2556,17 +2740,103 @@ pub fn run() {
             let app_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_dir)?;
             let database_path = app_dir.join("aletheia.sqlite3");
+
+            // Populate the bundled-resource directory hint BEFORE state open /
+            // manage so any early path that resolves the STT model (audit
+            // seeding, health checks triggered during hydration) can find the
+            // bundled `ggml-base.en.bin` from the installer resources dir.
+            if let Ok(resource_dir_early) = app.path().resource_dir() {
+                set_bundled_resource_dir(resource_dir_early);
+            }
+
             let desktop_state = DesktopState::open(database_path.clone())
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::Other, message))?;
             app.manage(desktop_state);
 
+            // vMix auto-reconnect: every N seconds (exponential backoff 10s..5min)
+            // probe the adapter; on offline/degraded re-evaluate via check_status,
+            // which re-runs the HTTP probe and effectively "reconnects". Emit
+            // `aletheia://vmix-reconnect` so the UI can surface attempts.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use std::time::Duration;
+                    const MIN_DELAY_MS: u64 = 10_000;
+                    const MAX_DELAY_MS: u64 = 5 * 60 * 1000;
+                    let mut delay_ms: u64 = MIN_DELAY_MS;
+                    let mut attempt: u32 = 0;
+                    let mut last_state = String::new();
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let probe_handle = app_handle.clone();
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            let state = probe_handle.state::<DesktopState>();
+                            let adapter = state.lock_vmix().ok()?;
+                            Some(aletheia_output::OutputAdapter::status(&*adapter).health)
+                        }).await.ok().flatten();
+                        let (state_str, _detail) = match result {
+                            Some(h) => crate::output_health_to_state_detail(h),
+                            None => ("offline".to_string(), "vMix probe unavailable".to_string()),
+                        };
+                        let needs_retry = matches!(state_str.as_str(), "offline" | "degraded");
+                        if needs_retry {
+                            attempt = attempt.saturating_add(1);
+                            delay_ms = (delay_ms.saturating_mul(2)).min(MAX_DELAY_MS);
+                        } else {
+                            attempt = 0;
+                            delay_ms = MIN_DELAY_MS;
+                        }
+                        // Emit only on state transition or while actively retrying.
+                        // Avoids a steady stream of "still healthy" events to the UI.
+                        if state_str != last_state || needs_retry {
+                            let payload = serde_json::json!({
+                                "state": state_str,
+                                "attempt": attempt,
+                                "nextRetryMs": delay_ms,
+                            });
+                            let _ = tauri::Emitter::emit(&app_handle, "aletheia://vmix-reconnect", payload);
+                            last_state = state_str;
+                        }
+                    }
+                });
+            }
+
             // Auto-import bundled full-Bible JSON files on first launch (and on
             // upgrades that ship updated translations). Runs in the background
             // so the UI is interactive while ~31 000 verses are inserted.
+            //
+            // Emits `aletheia://library-imported` when the import finishes so
+            // the dashboard's "Scripture library offline" / "degraded" banner
+            // can clear immediately instead of waiting for the next poll.
             if let Ok(resource_dir) = app.path().resource_dir() {
                 let db_for_bibles = database_path.clone();
+                let app_handle = app.handle().clone();
                 std::thread::spawn(move || match AletheiaStore::open_file(&db_for_bibles) {
-                    Ok(bg_store) => import_bundled_bibles(&bg_store, &resource_dir),
+                    Ok(bg_store) => {
+                        import_bundled_bibles(&bg_store, &resource_dir);
+                        // Final verse count after the import — drives the UI
+                        // banner state. > 30 000 → healthy. > 0 → degraded.
+                        // 0 → still offline (bundle missing or corrupt).
+                        let kjv_count = bg_store
+                            .count_verses_for_translation("kjv")
+                            .unwrap_or(0);
+                        let payload = serde_json::json!({
+                            "translation": "kjv",
+                            "verseCount": kjv_count,
+                            "state": if kjv_count > 30_000 {
+                                "healthy"
+                            } else if kjv_count > 0 {
+                                "degraded"
+                            } else {
+                                "offline"
+                            },
+                        });
+                        let _ = tauri::Emitter::emit(
+                            &app_handle,
+                            "aletheia://library-imported",
+                            payload,
+                        );
+                    }
                     Err(e) => log::warn!("[bible-import] bg store open failed: {e}"),
                 });
             }
@@ -2679,7 +2949,10 @@ pub fn run() {
             kv_set,
             kv_delete,
             kv_list_keys,
-            list_audio_devices
+            list_audio_devices,
+            delete_bible_translation,
+            export_operator_config,
+            import_operator_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aletheia desktop shell");

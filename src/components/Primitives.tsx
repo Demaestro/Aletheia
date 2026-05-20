@@ -6,12 +6,12 @@ export const cn = (...classes: Array<string | false | null | undefined>) =>
   classes.filter(Boolean).join(" ");
 
 const toneClass: Record<Tone, string> = {
-  healthy: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shadow-neon shadow-emerald-500/20",
-  degraded: "border-amber-500/30 bg-amber-500/10 text-amber-400 shadow-neon shadow-amber-500/20",
-  offline: "border-red-500/30 bg-red-500/10 text-red-400 shadow-neon shadow-red-500/20",
-  live: "border-red-500/40 bg-red-500/20 text-red-400 shadow-neon shadow-red-500/30",
-  armed: "border-violet-500/30 bg-violet-500/10 text-violet-400 shadow-neon shadow-violet-500/20",
-  neutral: "border-white/10 bg-white/5 text-white/60"
+  healthy: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 shadow-neon shadow-emerald-500/20",
+  degraded: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400 shadow-neon shadow-amber-500/20",
+  offline: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400 shadow-neon shadow-red-500/20",
+  live: "border-red-500/40 bg-red-500/20 text-red-600 dark:text-red-400 shadow-neon shadow-red-500/30",
+  armed: "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400 shadow-neon shadow-violet-500/20",
+  neutral: "border-line bg-mist text-muted"
 };
 
 export const fadeUp = {
@@ -57,7 +57,7 @@ export function SectionHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-4 border-b border-white/5 pb-5 md:flex-row md:items-end md:justify-between">
+    <div className="flex flex-col gap-4 border-b border-line pb-5 md:flex-row md:items-end md:justify-between">
       <div>
         <p className="text-xs font-semibold uppercase tracking-[0.12em] text-violet-400/80">{eyebrow}</p>
         <h2 className="mt-2 text-2xl font-semibold tracking-tight text-ink">{title}</h2>
@@ -92,9 +92,9 @@ export function ActionButton({
         tone === "primary" &&
           "bg-gradient-to-r from-violet-600 to-indigo-600 text-white ring-1 ring-white/10 shadow-[0_4px_20px_-4px_rgba(124,58,237,0.5)] hover:from-violet-500 hover:to-indigo-500 hover:shadow-[0_8px_28px_-4px_rgba(124,58,237,0.65)] active:shadow-[0_2px_10px_-2px_rgba(124,58,237,0.4)]",
         tone === "secondary" &&
-          "border border-white/10 bg-white/5 text-white/80 backdrop-blur-md hover:border-violet-400/30 hover:bg-white/[0.09] hover:text-white hover:shadow-[0_2px_12px_-2px_rgba(124,58,237,0.25)]",
+          "border border-line bg-mist text-ink hover:border-accent/40 hover:bg-mist/80 hover:shadow-[0_2px_12px_-2px_rgba(124,58,237,0.25)]",
         tone === "danger" &&
-          "border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 hover:shadow-[0_4px_18px_-4px_rgba(239,68,68,0.5)]",
+          "border border-red-500/30 bg-red-500/10 text-red-500 dark:text-red-400 hover:bg-red-500/20 hover:shadow-[0_4px_18px_-4px_rgba(239,68,68,0.5)]",
         className
       )}
     >
@@ -123,7 +123,7 @@ export function ConfidenceBar({ value }: { value: number }) {
         <span>Confidence</span>
         <span className="font-mono text-ink">{value}%</span>
       </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-white/5 ring-1 ring-white/5" aria-hidden="true">
+      <div className="h-1.5 overflow-hidden rounded-full bg-line ring-1 ring-line" aria-hidden="true">
         <div
           className={cn("h-full rounded-full transition-[width] duration-500 ease-out", tone)}
           style={{ width: `${value}%` }}
@@ -152,7 +152,7 @@ export function CandidateRow({
         "group rounded-[6px] border p-4 transition-all duration-200 ease-out",
         active
           ? "border-violet-500/40 bg-gradient-to-br from-violet-500/10 to-transparent shadow-[0_8px_30px_-8px_rgba(124,58,237,0.3)]"
-          : "border-white/8 bg-white/[0.03] hover:border-violet-400/30 hover:bg-white/[0.05] hover:shadow-[0_4px_20px_-8px_rgba(124,58,237,0.2)]"
+          : "border-line bg-paper hover:border-violet-400/30 hover:bg-mist hover:shadow-[0_4px_20px_-8px_rgba(124,58,237,0.2)]"
       )}
     >
       <div className="flex items-start justify-between gap-4">
@@ -235,7 +235,7 @@ export function Metric({
   detail: string;
 }) {
   return (
-    <div className="border-l border-white/5 pl-4">
+    <div className="border-l border-line pl-4">
       <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted">{label}</p>
       <p className="mt-2 text-xl font-semibold text-ink">{value}</p>
       <p className="mt-1 text-sm text-muted">{detail}</p>

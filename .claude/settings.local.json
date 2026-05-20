@@ -168,7 +168,8 @@
       "Bash(curl -sL --max-time 120 -o src-tauri/resources/bibles/web-full.json \"https://raw.githubusercontent.com/thiagobodruk/bible/master/json/en_bbe.json\")",
       "Bash(grep -n \"resources\\\\|\\\\\"icon\\\\\":\\\\\\\\|targets\" src-tauri/tauri.conf.json)",
       "Bash(grep -n \"get_translations\\\\|insert_translation\\\\|count_verses\\\\|verses\\\\\\\\.count\" crates/aletheia-store/src/lib.rs)",
-      "Bash(gh auth *)"
+      "Bash(gh auth *)",
+      "Bash(gh repo *)"
     ]
   }
 }

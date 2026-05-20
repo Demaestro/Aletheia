@@ -238,18 +238,22 @@ pub fn start_stream_overlay_server(
                         body = render_html(&snap);
                         content_type = "text/html; charset=utf-8";
                     }
-                    let resp = Response::from_string(body)
-                        .with_header(
-                            Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
-                                .unwrap(),
-                        )
-                        .with_header(
-                            Header::from_bytes(
-                                &b"Cache-Control"[..],
-                                &b"no-store, max-age=0"[..],
-                            )
-                            .unwrap(),
-                        );
+                    let mut resp = Response::from_string(body);
+                    match Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+                        Ok(h) => resp = resp.with_header(h),
+                        Err(_) => log::error!(
+                            "[stream-server] failed to construct Content-Type header"
+                        ),
+                    }
+                    match Header::from_bytes(
+                        &b"Cache-Control"[..],
+                        &b"no-store, max-age=0"[..],
+                    ) {
+                        Ok(h) => resp = resp.with_header(h),
+                        Err(_) => log::error!(
+                            "[stream-server] failed to construct Cache-Control header"
+                        ),
+                    }
                     let _ = request.respond(resp);
                 }
                 Ok(None) => {}

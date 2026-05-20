@@ -17,6 +17,7 @@ import {
   Subtitles,
   Tv
 } from "lucide-react";
+
 import type {
   HardwareChecklistItem,
   HealthItem,
@@ -34,17 +35,18 @@ export const productName = "Aletheia";
 // Landing / Onboarding are accessible via the logo; Manual Search is a
 // right-rail shortcut so it doesn't crowd the sidebar.
 export const navItems: NavItem[] = [
-  { key: "dashboard",     label: "Dashboard",    eyebrow: "Session",  icon: LayoutDashboard },
-  { key: "transcript",    label: "Transcript",   eyebrow: "Listen",   icon: Subtitles },
-  { key: "queue",         label: "Scripture",    eyebrow: "Approve",  icon: CheckCircle2 },
-  { key: "output",        label: "Output",       eyebrow: "Present",  icon: MonitorUp },
-  { key: "songs",         label: "Songs",        eyebrow: "Lyrics",   icon: Music },
-  { key: "stream",        label: "Stream",       eyebrow: "Overlay",  icon: Tv },
-  { key: "integrations",  label: "Integrations", eyebrow: "Connect",  icon: Cable },
-  { key: "fleet",         label: "Fleet",        eyebrow: "Sync",     icon: Network },
-  { key: "clips",         label: "Clips",        eyebrow: "EDL",      icon: Film },
-  { key: "health",        label: "Health",       eyebrow: "Assets",   icon: Gauge },
-  { key: "search",        label: "Search",       eyebrow: "Manual",   icon: Search },
+  { key: "dashboard",    label: "Dashboard",    eyebrow: "Session",     icon: LayoutDashboard },
+  { key: "transcript",   label: "Transcript",   eyebrow: "Listen",      icon: Subtitles },
+  { key: "queue",        label: "Scripture",    eyebrow: "Approve",     icon: CheckCircle2 },
+  { key: "output",       label: "Output",       eyebrow: "Present",     icon: MonitorUp },
+  { key: "songs",        label: "Songs",        eyebrow: "Lyrics",      icon: Music },
+  { key: "stream",       label: "Stream",       eyebrow: "Overlay",     icon: Tv },
+  { key: "integrations", label: "Integrations", eyebrow: "Connect",     icon: Cable },
+  { key: "fleet",        label: "Fleet",        eyebrow: "Sync",        icon: Network },
+  { key: "clips",        label: "Clips",        eyebrow: "EDL",         icon: Film },
+  { key: "health",       label: "Health",       eyebrow: "Assets",      icon: Gauge },
+  { key: "diagnostics",  label: "Diagnostics",  eyebrow: "Pipeline",    icon: Activity },
+  { key: "search",       label: "Search",       eyebrow: "Manual",      icon: Search },
 ];
 
 export const heroImage =
@@ -389,6 +391,7 @@ export const screenOrder: ScreenKey[] = [
   "theme",
   "integrations",
   "health",
+  "diagnostics",
   "onboarding",
   "search"
 ];

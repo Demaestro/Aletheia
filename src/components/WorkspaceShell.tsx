@@ -1,10 +1,13 @@
 import type { ReactNode } from "react";
-import { RadioTower, Search, Globe } from "lucide-react";
+import { useRef, useState, useEffect } from "react";
+import { RadioTower, Search, Globe, Moon, Sun, AlertTriangle, Mic } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { navItems, productName } from "../data/production";
+import { useThemeStore } from "../store/useThemeStore";
 import type { DesktopRuntimeStatus, ScreenKey, ScriptureCandidate } from "../types";
 import { ActionButton, OutputCanvas, cn } from "./Primitives";
 import { ServicePlanTimeline } from "./ServicePlanTimeline";
+import { useAudioStream } from "../contexts/AudioStreamContext";
 
 // Small inline badge for the dark topbar context
 function TopBadge({ label, tone }: { label: string; tone: "ok" | "warn" | "neutral" }) {
@@ -33,6 +36,8 @@ export function WorkspaceShell({
   onToggleArmed,
   onSendLive,
   onManualSearch,
+  onPanicClear,
+  captureActive,
 }: {
   active: ScreenKey;
   onNavigate: (screen: ScreenKey) => void;
@@ -45,9 +50,77 @@ export function WorkspaceShell({
   onToggleArmed: () => void;
   onSendLive: () => void;
   onManualSearch?: () => void;
+  onPanicClear?: () => void;
+  captureActive?: boolean;
 }) {
   const isDesktop = desktopStatus?.mode === "tauri";
   const { t, i18n } = useTranslation();
+  const themeMode = useThemeStore((s) => s.themeMode);
+  const setThemeMode = useThemeStore((s) => s.setThemeMode);
+  const resolvedDark =
+    themeMode === "dark" ||
+    (themeMode === "system" &&
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+  const toggleTheme = () => setThemeMode(resolvedDark ? "light" : "dark");
+
+  // Triple-press guard for the panic button — must press 3× within 1.5 s
+  const panicPressCount = useRef(0);
+  const panicTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [panicArmed, setPanicArmed] = useState(false);
+  const handlePanicPress = () => {
+    panicPressCount.current += 1;
+    if (panicTimerRef.current) clearTimeout(panicTimerRef.current);
+    if (panicPressCount.current >= 3) {
+      panicPressCount.current = 0;
+      setPanicArmed(false);
+      onPanicClear?.();
+      return;
+    }
+    if (panicPressCount.current === 2) {
+      setPanicArmed(true);
+    }
+    panicTimerRef.current = setTimeout(() => {
+      panicPressCount.current = 0;
+      setPanicArmed(false);
+    }, 1500);
+  };
+
+  // Mini VU bar from the shared AudioStream
+  const { stream } = useAudioStream();
+  const vuCtxRef     = useRef<AudioContext | null>(null);
+  const vuAnalRef    = useRef<AnalyserNode | null>(null);
+  const vuAnimRef    = useRef<number>(0);
+  const [vuLevel, setVuLevel] = useState(0); // 0-5 bars
+  useEffect(() => {
+    if (!captureActive || !stream) {
+      setVuLevel(0);
+      if (vuCtxRef.current) { vuCtxRef.current.close().catch(() => undefined); vuCtxRef.current = null; }
+      cancelAnimationFrame(vuAnimRef.current);
+      return;
+    }
+    const ctx = new AudioContext();
+    vuCtxRef.current = ctx;
+    const src = ctx.createMediaStreamSource(stream);
+    const anal = ctx.createAnalyser();
+    anal.fftSize = 128;
+    anal.smoothingTimeConstant = 0.7;
+    src.connect(anal);
+    vuAnalRef.current = anal;
+    const buf = new Uint8Array(anal.frequencyBinCount);
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      anal.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) { const d = (buf[i] - 128) / 128; sum += d * d; }
+      const rms = Math.sqrt(sum / buf.length);
+      setVuLevel(Math.min(5, Math.round(rms * 5 * 10)));
+      vuAnimRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => { cancelled = true; cancelAnimationFrame(vuAnimRef.current); ctx.close().catch(() => undefined); };
+  }, [captureActive, stream]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-gradient-to-br from-slate-900 via-paper to-black text-ink font-sans">
@@ -73,8 +146,14 @@ export function WorkspaceShell({
             "h-1.5 w-1.5 shrink-0 rounded-full",
             isDesktop ? "bg-emerald-400" : "bg-amber-400"
           )} />
-          <span className="truncate text-[11px] text-white/45">
-            {isDesktop ? t("status.coreOnline") : t("status.browserMode")}
+          <span className="truncate text-[11px] text-muted">
+            {/* i18next splits on `:` for namespaces and `.` for nested keys.
+                The resources are organised so each top-level group (status,
+                navigation, …) is a namespace, so the key here uses colon
+                notation. Without this, t() returns the literal key string
+                ("status.coreOnline") because the `translation` default
+                namespace doesn't exist in our resources. */}
+            {isDesktop ? t("status:coreOnline") : t("status:browserMode")}
           </span>
         </div>
 
@@ -92,7 +171,7 @@ export function WorkspaceShell({
                   "flex w-full items-center gap-2.5 rounded-[6px] px-2.5 py-[7px] text-left text-[13px] transition-colors",
                   isActive
                     ? "bg-gradient-to-r from-violet-600 to-indigo-600 font-semibold text-white shadow-neon shadow-violet-500/20"
-                    : "font-medium text-white/50 hover:bg-white/[0.06] hover:text-white/90"
+                    : "font-medium text-white/70 hover:bg-white/[0.06] hover:text-white"
                 )}
                 aria-current={isActive ? "page" : undefined}
               >
@@ -103,12 +182,24 @@ export function WorkspaceShell({
           })}
         </nav>
 
-        {/* Footer meta */}
+        {/* Footer meta + mini VU */}
         <div className="border-t border-white/[0.07] px-4 py-2.5">
-          <p className="truncate text-[10px] text-white/25">
+          {captureActive && (
+            <div className="mb-2 flex items-center gap-1.5" title="Live audio level">
+              <Mic className="h-3 w-3 text-emerald-400/70 shrink-0" aria-hidden="true" />
+              {[1,2,3,4,5].map((bar) => (
+                <div
+                  key={bar}
+                  className="h-2 w-full rounded-sm transition-colors duration-75"
+                  style={{ background: vuLevel >= bar ? (vuLevel >= 5 ? "#ef4444" : vuLevel >= 4 ? "#f59e0b" : "#34d399") : "rgba(255,255,255,0.08)" }}
+                />
+              ))}
+            </div>
+          )}
+          <p className="truncate text-[10px] text-muted">
             {desktopStatus?.serviceSession ?? "loading…"}
           </p>
-          <p className="mt-0.5 truncate text-[10px] text-white/20">
+          <p className="mt-0.5 truncate text-[10px] text-muted/60">
             {isDesktop ? `${desktopStatus?.auditCount ?? 0} audit events` : "Offline safe"}
           </p>
         </div>
@@ -119,7 +210,7 @@ export function WorkspaceShell({
 
         {/* Slim topbar */}
         <header className="flex h-12 shrink-0 items-center justify-between border-b border-light/5 bg-transparent px-6">
-          <h1 className="text-[14px] font-semibold tracking-tight text-white/90">{title}</h1>
+          <h1 className="text-[14px] font-semibold tracking-tight text-ink">{title}</h1>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5 mr-2 rounded-md border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] shadow-glass backdrop-blur-md transition-colors hover:bg-white/10">
               <Globe className="h-3 w-3 text-white/60" />
@@ -130,8 +221,24 @@ export function WorkspaceShell({
               >
                 <option value="en" className="bg-mist text-white">English</option>
                 <option value="ig" className="bg-mist text-white">Igbo</option>
+                <option value="yo" className="bg-mist text-white">Yorùbá</option>
+                <option value="ha" className="bg-mist text-white">Hausa</option>
               </select>
             </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="flex items-center gap-1.5 rounded-[6px] border border-white/10 bg-white/5 px-2.5 py-1 text-[12px] font-medium text-white/70 shadow-glass backdrop-blur-md transition-colors hover:bg-white/10 hover:text-white"
+              aria-label={resolvedDark ? "Switch to light mode" : "Switch to dark mode"}
+              title={resolvedDark ? "Switch to light mode" : "Switch to dark mode"}
+            >
+              {resolvedDark ? (
+                <Sun className="h-3.5 w-3.5" aria-hidden="true" />
+              ) : (
+                <Moon className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+              <span>{resolvedDark ? "Light" : "Dark"}</span>
+            </button>
             <TopBadge label={isDesktop ? "Desktop" : "Browser"} tone={isDesktop ? "ok" : "warn"} />
             {desktopStatus?.dataMiserEnabled && (
               <TopBadge label="Data miser" tone="warn" />
@@ -166,17 +273,17 @@ export function WorkspaceShell({
 
         {/* Rail header */}
         <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-white/30">
+          <span className="text-[11px] font-bold uppercase tracking-widest text-graphite">
             Production
           </span>
           <div className="flex items-center gap-1.5">
             <span className={cn(
-              "h-1.5 w-1.5 rounded-full transition-colors",
+              "h-2 w-2 rounded-full transition-colors",
               armed ? "bg-rose-400" : "bg-white/20"
             )} />
             <span className={cn(
-              "text-[11px] font-medium",
-              armed ? "text-rose-400" : "text-white/30"
+              "text-[11px] font-semibold",
+              armed ? "text-rose-400" : "text-muted"
             )}>
               {armed ? "Armed" : "Hold"}
             </span>
@@ -187,14 +294,14 @@ export function WorkspaceShell({
         <div className="flex flex-1 flex-col gap-2.5 overflow-y-auto p-3">
 
           <div>
-            <p className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-widest text-white/30">
+            <p className="mb-1.5 px-0.5 text-[10px] font-bold uppercase tracking-widest text-graphite">
               Preview
             </p>
             <OutputCanvas label="" candidate={preview} state="preview" />
           </div>
 
           <div>
-            <p className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-widest text-white/30">
+            <p className="mb-1.5 px-0.5 text-[10px] font-bold uppercase tracking-widest text-graphite">
               Live
             </p>
             <div className={cn(
@@ -217,7 +324,26 @@ export function WorkspaceShell({
               Go live
             </ActionButton>
           </div>
-          <p className="text-center text-[10px] leading-relaxed text-white/22">
+          {/* Panic button — clears all outputs, triple-press required */}
+          {onPanicClear && (
+            <button
+              id="panic-clear-btn"
+              type="button"
+              onClick={handlePanicPress}
+              className={cn(
+                "w-full flex items-center justify-center gap-1.5 rounded-[6px] border px-3 py-2 text-[11px] font-bold uppercase tracking-widest transition-all",
+                panicArmed
+                  ? "animate-pulse border-rose-500 bg-rose-500/20 text-rose-400 shadow-[0_0_12px_rgba(239,68,68,0.4)]"
+                  : "border-rose-800/50 bg-rose-950/30 text-rose-600 hover:border-rose-600 hover:bg-rose-900/40 hover:text-rose-400"
+              )}
+              title={panicArmed ? "Press once more to clear all outputs" : "Triple-press to clear all outputs (F12)"}
+              aria-label="Emergency clear all outputs"
+            >
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              {panicArmed ? "CONFIRM CLEAR" : "CLEAR ALL OUTPUTS"}
+            </button>
+          )}
+          <p className="text-center text-[10px] leading-relaxed text-muted">
             {armed
               ? "Armed — operator action required to transmit."
               : "Arm destinations before sending live."}
